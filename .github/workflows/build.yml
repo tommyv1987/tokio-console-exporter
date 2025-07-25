@@ -32,12 +32,11 @@ jobs:
       run: |
         echo "Checking build output..."
         ls -la tokio-console-prometheus-exporter/target/x86_64-unknown-linux-gnu/release/
-        echo "Binary name should be: tokio_console_exporter"
 
     - name: Create release directory
       run: |
         mkdir -p release
-        cp tokio-console-prometheus-exporter/target/x86_64-unknown-linux-gnu/release/tokio_console_exporter release/
+        cp tokio-console-prometheus-exporter/target/x86_64-unknown-linux-gnu/release/tokio-console-exporter release/
         cp tokio-console-exporter.service release/
         cp -r monitoring release/
         cp README.md release/
