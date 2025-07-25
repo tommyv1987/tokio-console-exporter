@@ -5,15 +5,13 @@ global:
 rule_files:
 
 scrape_configs:
-  # Prometheus itself
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
 
-  # Tokio Console Exporter (no auth)
   - job_name: 'tokio-console-exporter'
     static_configs:
-      - targets: ['45.12.114.147:9090']
+      - targets: ['you-end-point-here:9090']
     metrics_path: /metrics
     honor_labels: true
     scrape_interval: 10s
