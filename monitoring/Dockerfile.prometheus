@@ -1,0 +1,4 @@
+FROM prom/prometheus:latest
+
+# Copy the configuration file
+COPY config/prometheus.yml /etc/prometheus/prometheus.yml 

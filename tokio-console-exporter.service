@@ -1,0 +1,32 @@
+[Unit]
+Description=Tokio Console Prometheus Exporter (CPU Optimized)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/tokio-console-exporter
+ExecStart=/opt/tokio-console-exporter/tokio-console-exporter \
+    --console-addr 127.0.0.1:6669 \
+    --listen-addr 0.0.0.0:9090 \
+    --interval 30 \
+
+Environment=RUST_LOG=warn
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tokio-console-exporter
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitBurst=3
+StartLimitInterval=300
+
+[Install]
+WantedBy=multi-user.target 
