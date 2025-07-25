@@ -1,12 +1,9 @@
 name: Build Linux Binary
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   release:
-    types: [published]
+    types: [published, created]
+  workflow_dispatch:  # Manual trigger
 
 jobs:
   build:
@@ -31,10 +28,16 @@ jobs:
         cd tokio-console-prometheus-exporter
         cargo build --release --target x86_64-unknown-linux-gnu
 
+    - name: Debug build output
+      run: |
+        echo "Checking build output..."
+        ls -la tokio-console-prometheus-exporter/target/x86_64-unknown-linux-gnu/release/
+        echo "Binary name should be: tokio_console_exporter"
+
     - name: Create release directory
       run: |
         mkdir -p release
-        cp tokio-console-prometheus-exporter/target/x86_64-unknown-linux-gnu/release/tokio-console-prometheus-exporter release/
+        cp tokio-console-prometheus-exporter/target/x86_64-unknown-linux-gnu/release/tokio_console_exporter release/
         cp tokio-console-exporter.service release/
         cp -r monitoring release/
         cp README.md release/
@@ -45,27 +48,29 @@ jobs:
         tar -czf tokio-console-prometheus-exporter-linux-x86_64.tar.gz *
         cd ..
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
+    - name: Upload artifact (Manual builds)
+      if: github.event_name == 'workflow_dispatch'
+      uses: actions/upload-artifact@v3
       with:
         name: tokio-console-prometheus-exporter-linux-x86_64
         path: release/tokio-console-prometheus-exporter-linux-x86_64.tar.gz
         retention-days: 30
 
     - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
+      if: github.event_name == 'release'
       id: create_release
       uses: actions/create-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
+        tag_name: ${{ github.event.release.tag_name }}
+        release_name: ${{ github.event.release.name }}
+        body: ${{ github.event.release.body }}
         draft: false
-        prerelease: false
+        prerelease: ${{ github.event.release.prerelease }}
 
     - name: Upload Release Asset
-      if: startsWith(github.ref, 'refs/tags/')
+      if: github.event_name == 'release'
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
