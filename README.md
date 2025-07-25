@@ -6,7 +6,8 @@ Prometheus exporter for Tokio Console metrics, written in Rust.
 
 ## Quick Start
 
-```
+### Local Development
+```bash
 # Build and run
 cd tokio-console-prometheus-exporter
 cargo run -- --no-auth
@@ -17,6 +18,15 @@ TOKIO_EXPORTER_TOKEN=your-token cargo run
 # Setup monitoring
 cd monitoring
 ./setup.sh
+```
+
+### Build Linux Binary
+```bash
+# Build locally
+./build-linux.sh
+
+# Or build with GitHub Actions (automatic on push)
+# Check Actions tab for artifacts
 ```
 
 ## Features
