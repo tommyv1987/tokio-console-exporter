@@ -1,12 +1,12 @@
+use bytes::Bytes;
 use clap::Parser;
 use console_api::instrument::instrument_client::InstrumentClient;
 use console_api::instrument::InstrumentRequest;
 use futures::stream::StreamExt;
+use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use prometheus::{
-    Counter, CounterVec, Encoder, GaugeVec, IntGauge, Opts, Registry, TextEncoder,
-};
+use prometheus::{Counter, CounterVec, Encoder, GaugeVec, IntGauge, Opts, Registry, TextEncoder};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,11 +14,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error, info};
-use bytes::Bytes;
-use http_body_util::Full;
 
 #[derive(Parser, Debug)]
-#[command(name = "tokio-console-prometheus-exporter", about = "Prometheus exporter for Tokio Console")]
+#[command(
+    name = "tokio-console-prometheus-exporter",
+    about = "Prometheus exporter for Tokio Console"
+)]
 struct Args {
     #[arg(short, long, default_value = "127.0.0.1:6669")]
     console_addr: String,
@@ -35,6 +36,9 @@ struct Metrics {
     tasks_total: IntGauge,
     tasks_with_location: IntGauge,
     tasks_without_location: IntGauge,
+    tasks_running: IntGauge,
+    tasks_idle: IntGauge,
+    tasks_completed: IntGauge,
     task_polls: CounterVec,
     task_wakes: CounterVec,
     task_state: GaugeVec,
@@ -44,6 +48,16 @@ struct Metrics {
 
 // Use span_id as the key (like tokio-console), not task_id
 type TaskMetadataStore = Arc<Mutex<HashMap<u64, TaskMetadata>>>;
+
+// Track task states
+type TaskStateStore = Arc<Mutex<HashMap<u64, TaskState>>>;
+
+#[derive(Debug, Clone)]
+enum TaskState {
+    Idle,
+    Running,
+    Completed,
+}
 
 #[derive(Clone, Debug)]
 struct TaskMetadata {
@@ -56,26 +70,53 @@ struct TaskMetadata {
 impl Metrics {
     fn new(registry: &Registry) -> Self {
         let tasks_total = IntGauge::new("tokio_tasks_total", "Total number of tasks").unwrap();
-        let tasks_with_location = IntGauge::new("tokio_tasks_with_location", "Tasks with location info").unwrap();
-        let tasks_without_location = IntGauge::new("tokio_tasks_without_location", "Tasks without location info").unwrap();
+        let tasks_with_location =
+            IntGauge::new("tokio_tasks_with_location", "Tasks with location info").unwrap();
+        let tasks_without_location = IntGauge::new(
+            "tokio_tasks_without_location",
+            "Tasks without location info",
+        )
+        .unwrap();
+        let tasks_running =
+            IntGauge::new("tokio_tasks_running", "Number of currently running tasks").unwrap();
+        let tasks_idle =
+            IntGauge::new("tokio_tasks_idle", "Number of currently idle tasks").unwrap();
+        let tasks_completed =
+            IntGauge::new("tokio_tasks_completed", "Number of completed tasks").unwrap();
         let task_polls = CounterVec::new(
             Opts::new("tokio_task_polls_total", "Total number of task polls"),
             &["task_name", "task_location", "task_kind"],
-        ).unwrap();
+        )
+        .unwrap();
         let task_wakes = CounterVec::new(
             Opts::new("tokio_task_wakes_total", "Total number of task wakes"),
             &["task_name", "task_location", "task_kind"],
-        ).unwrap();
+        )
+        .unwrap();
         let task_state = GaugeVec::new(
-            Opts::new("tokio_task_state", "Task state (0=idle, 1=running, 2=completed)"),
+            Opts::new(
+                "tokio_task_state",
+                "Task state (0=idle, 1=running, 2=completed)",
+            ),
             &["task_name", "task_location", "task_kind"],
-        ).unwrap();
+        )
+        .unwrap();
         let scrapes_total = Counter::new("tokio_scrapes_total", "Total number of scrapes").unwrap();
-        let scrape_errors = Counter::new("tokio_scrape_errors_total", "Total number of scrape errors").unwrap();
+        let scrape_errors =
+            Counter::new("tokio_scrape_errors_total", "Total number of scrape errors").unwrap();
 
         registry.register(Box::new(tasks_total.clone())).unwrap();
-        registry.register(Box::new(tasks_with_location.clone())).unwrap();
-        registry.register(Box::new(tasks_without_location.clone())).unwrap();
+        registry
+            .register(Box::new(tasks_with_location.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(tasks_without_location.clone()))
+            .unwrap();
+        registry.register(Box::new(tasks_running.clone())).unwrap();
+        registry.register(Box::new(tasks_idle.clone())).unwrap();
+        registry
+            .register(Box::new(tasks_completed.clone()))
+            .unwrap();
         registry.register(Box::new(task_polls.clone())).unwrap();
         registry.register(Box::new(task_wakes.clone())).unwrap();
         registry.register(Box::new(task_state.clone())).unwrap();
@@ -86,11 +127,14 @@ impl Metrics {
             tasks_total,
             tasks_with_location,
             tasks_without_location,
+            tasks_running,
+            tasks_idle,
+            tasks_completed,
             task_polls,
             task_wakes,
             task_state,
             scrapes_total,
-            scrape_errors
+            scrape_errors,
         }
     }
 }
@@ -98,14 +142,21 @@ impl Metrics {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("tokio_console_prometheus_exporter=debug"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "tokio_console_prometheus_exporter=debug",
+        ))
         .init();
 
     let args = Args::parse();
-    let auth_token = args.auth_token.or_else(|| std::env::var("TOKIO_EXPORTER_TOKEN").ok());
+    let auth_token = args
+        .auth_token
+        .or_else(|| std::env::var("TOKIO_EXPORTER_TOKEN").ok());
 
     info!("Starting Tokio Console Prometheus Exporter");
-    info!("Console: {}, Listen: {}, Interval: {}s", args.console_addr, args.listen_addr, args.interval);
+    info!(
+        "Console: {}, Listen: {}, Interval: {}s",
+        args.console_addr, args.listen_addr, args.interval
+    );
 
     let registry = Registry::new();
     let metrics = Arc::new(Metrics::new(&registry));
@@ -121,17 +172,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(auth_value) = auth_header.to_str() {
                         if auth_value != format!("Bearer {}", token) {
                             return Ok::<Response<Full<Bytes>>, hyper::Error>(
-                                Response::builder().status(401).body(Full::new(Bytes::from("Unauthorized"))).unwrap(),
+                                Response::builder()
+                                    .status(401)
+                                    .body(Full::new(Bytes::from("Unauthorized")))
+                                    .unwrap(),
                             );
                         }
                     } else {
                         return Ok::<Response<Full<Bytes>>, hyper::Error>(
-                            Response::builder().status(401).body(Full::new(Bytes::from("Invalid Authorization"))).unwrap(),
+                            Response::builder()
+                                .status(401)
+                                .body(Full::new(Bytes::from("Invalid Authorization")))
+                                .unwrap(),
                         );
                     }
                 } else {
                     return Ok::<Response<Full<Bytes>>, hyper::Error>(
-                        Response::builder().status(401).body(Full::new(Bytes::from("Authorization required"))).unwrap(),
+                        Response::builder()
+                            .status(401)
+                            .body(Full::new(Bytes::from("Authorization required")))
+                            .unwrap(),
                     );
                 }
             }
@@ -149,11 +209,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap(),
                     )
                 }
-                "/" => Ok::<Response<Full<Bytes>>, hyper::Error>(
-                    Response::new(Full::new(Bytes::from("Tokio Console Prometheus Exporter\n\nUse /metrics endpoint")))
-                ),
+                "/" => Ok::<Response<Full<Bytes>>, hyper::Error>(Response::new(Full::new(
+                    Bytes::from("Tokio Console Prometheus Exporter\n\nUse /metrics endpoint"),
+                ))),
                 _ => Ok::<Response<Full<Bytes>>, hyper::Error>(
-                    Response::builder().status(404).body(Full::new(Bytes::from("Not Found"))).unwrap(),
+                    Response::builder()
+                        .status(404)
+                        .body(Full::new(Bytes::from("Not Found")))
+                        .unwrap(),
                 ),
             }
         }
@@ -167,19 +230,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (stream, _) = listener.accept().await.expect("listener accept failed");
             let service = service.clone();
             tokio::spawn(async move {
-                let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                    .await;
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
             });
         }
     });
 
     let task_metadata: TaskMetadataStore = Arc::new(Mutex::new(HashMap::new()));
+    let task_states: TaskStateStore = Arc::new(Mutex::new(HashMap::new()));
 
     let metrics_clone = metrics.clone();
     let task_metadata_clone = task_metadata.clone();
+    let task_states_clone = task_states.clone();
     let scraper_handle = tokio::spawn(async move {
-        scrape_loop(&args.console_addr, args.interval, metrics_clone, task_metadata_clone).await;
+        scrape_loop(
+            &args.console_addr,
+            args.interval,
+            metrics_clone,
+            task_metadata_clone,
+            task_states_clone,
+        )
+        .await;
     });
 
     tokio::signal::ctrl_c().await?;
@@ -195,14 +269,22 @@ async fn scrape_loop(
     interval: u64,
     metrics: Arc<Metrics>,
     task_metadata: TaskMetadataStore,
+    task_states: TaskStateStore,
 ) {
     let mut interval_timer = tokio::time::interval(Duration::from_secs(interval));
     loop {
         interval_timer.tick().await;
-        match scrape_console(console_addr, &metrics, task_metadata.clone()).await {
-            Ok((total_tasks, with_location, without_location)) => {
-                info!("Scraped {} tasks: {} with location, {} without",
-                      total_tasks, with_location, without_location);
+        match scrape_console(
+            console_addr,
+            &metrics,
+            task_metadata.clone(),
+            task_states.clone(),
+        )
+        .await
+        {
+            Ok((total_tasks, with_location, without_location, running, idle, completed)) => {
+                info!("Scraped {} tasks: {} with location, {} without, {} running, {} idle, {} completed",
+                      total_tasks, with_location, without_location, running, idle, completed);
                 metrics.scrapes_total.inc();
             }
             Err(e) => {
@@ -234,7 +316,10 @@ fn extract_task_metadata(task: &console_api::tasks::Task) -> TaskMetadata {
     static mut TASKS_LOGGED: usize = 0;
     unsafe {
         if TASKS_LOGGED < 5 {
-            debug!("Processing task with span_id {} meta_id {}", span_id, meta_id);
+            debug!(
+                "Processing task with span_id {} meta_id {}",
+                span_id, meta_id
+            );
             for field in &task.fields {
                 if let Some(console_api::field::Name::StrName(name)) = &field.name {
                     debug!("  Field '{}': {:?}", name, field.value);
@@ -317,8 +402,10 @@ fn extract_task_metadata(task: &console_api::tasks::Task) -> TaskMetadata {
         kind,
     };
 
-    debug!("Extracted metadata: task_id={}, name='{}', location='{}', kind='{}'",
-           metadata.task_id, metadata.name, metadata.location, metadata.kind);
+    debug!(
+        "Extracted metadata: task_id={}, name='{}', location='{}', kind='{}'",
+        metadata.task_id, metadata.name, metadata.location, metadata.kind
+    );
 
     metadata
 }
@@ -327,7 +414,8 @@ async fn scrape_console(
     console_addr: &str,
     metrics: &Metrics,
     task_metadata: TaskMetadataStore,
-) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+    task_states: TaskStateStore,
+) -> Result<(usize, usize, usize, usize, usize, usize), Box<dyn std::error::Error>> {
     let channel = Channel::from_shared(format!("http://{}", console_addr))?
         .connect()
         .await?;
@@ -336,10 +424,13 @@ async fn scrape_console(
 
     // DON'T clear the store - maintain persistent state like tokio-console
     // This allows us to accumulate tasks over time instead of losing them
-    info!("Starting persistent task capture (maintaining existing {} tasks)", {
-        let store = task_metadata.lock().unwrap();
-        store.len()
-    });
+    info!(
+        "Starting persistent task capture (maintaining existing {} tasks)",
+        {
+            let store = task_metadata.lock().unwrap();
+            store.len()
+        }
+    );
 
     // Track seen task IDs by span_id like tokio-console does
     let mut seen_span_ids = std::collections::HashSet::new();
@@ -357,22 +448,32 @@ async fn scrape_console(
     while let Some(Ok(update)) = stream.next().await {
         updates_processed += 1;
 
-        debug!("Update {}: new_metadata={}, task_update={:?}, first_update={}",
-               updates_processed,
-               update.new_metadata.is_some(),
-               update.task_update.as_ref().map(|tu| (tu.new_tasks.len(), tu.stats_update.len())),
-               first_update);
+        debug!(
+            "Update {}: new_metadata={}, task_update={:?}, first_update={}",
+            updates_processed,
+            update.new_metadata.is_some(),
+            update
+                .task_update
+                .as_ref()
+                .map(|tu| (tu.new_tasks.len(), tu.stats_update.len())),
+            first_update
+        );
 
         if let Some(task_update) = update.task_update {
             let new_tasks_count = task_update.new_tasks.len();
             let stats_count = task_update.stats_update.len();
 
-            debug!("Update {}: Processing {} new tasks, {} stats updates",
-                   updates_processed, new_tasks_count, stats_count);
+            debug!(
+                "Update {}: Processing {} new tasks, {} stats updates",
+                updates_processed, new_tasks_count, stats_count
+            );
 
             // The first update often contains all existing tasks
             if first_update && new_tasks_count > 0 {
-                info!("First update contains {} tasks (likely existing tasks)", new_tasks_count);
+                info!(
+                    "First update contains {} tasks (likely existing tasks)",
+                    new_tasks_count
+                );
             }
             first_update = false;
 
@@ -397,14 +498,15 @@ async fn scrape_console(
                         let store = task_metadata.lock().unwrap();
                         !store.values().any(|existing| {
                             // Compare by both span_id and task_id to handle duplicates correctly
-                            existing.task_id == metadata.task_id ||
-                            existing.name == metadata.name
+                            existing.task_id == metadata.task_id || existing.name == metadata.name
                         })
                     };
 
                     if is_truly_new {
-                        info!("New task discovered: span_id={}, task_id={}, name='{}', location='{}'",
-                              span_id, metadata.task_id, metadata.name, metadata.location);
+                        info!(
+                            "New task discovered: span_id={}, task_id={}, name='{}', location='{}'",
+                            span_id, metadata.task_id, metadata.name, metadata.location
+                        );
                     }
 
                     // Store by span_id (like tokio-console) not task_id
@@ -419,8 +521,10 @@ async fn scrape_console(
                         if let Some(existing) = store.get(&span_id) {
                             // Update if we got better location info
                             if existing.location == "unknown" && metadata.location != "unknown" {
-                                info!("Updating task span_id={} location: {} -> {}",
-                                      span_id, existing.location, metadata.location);
+                                info!(
+                                    "Updating task span_id={} location: {} -> {}",
+                                    span_id, existing.location, metadata.location
+                                );
                                 store.insert(span_id, metadata.clone());
                             }
                         }
@@ -440,26 +544,62 @@ async fn scrape_console(
                 if let Some(metadata) = metadata {
                     // Update metrics for this task
                     if let Some(poll_stats) = &stats.poll_stats {
-                        let polls_counter = metrics.task_polls
-                            .with_label_values(&[&metadata.name, &metadata.location, &metadata.kind]);
+                        let polls_counter = metrics.task_polls.with_label_values(&[
+                            &metadata.name,
+                            &metadata.location,
+                            &metadata.kind,
+                        ]);
                         polls_counter.reset();
                         polls_counter.inc_by(poll_stats.polls as f64);
                     }
 
                     if stats.wakes > 0 {
-                        let wakes_counter = metrics.task_wakes
-                            .with_label_values(&[&metadata.name, &metadata.location, &metadata.kind]);
+                        let wakes_counter = metrics.task_wakes.with_label_values(&[
+                            &metadata.name,
+                            &metadata.location,
+                            &metadata.kind,
+                        ]);
                         wakes_counter.reset();
                         wakes_counter.inc_by(stats.wakes as f64);
                     }
 
-                    let state = if stats.dropped_at.is_some() { 2.0 } else { 1.0 };
-                    metrics.task_state
+                    // Determine task state and track it
+                    let task_state = if stats.dropped_at.is_some() {
+                        TaskState::Completed
+                    } else if let Some(poll_stats) = &stats.poll_stats {
+                        // If task has been polled recently and is not completed, it's likely running
+                        // This is a simplified heuristic - in reality tokio-console uses more complex logic
+                        if poll_stats.polls > 0 {
+                            TaskState::Running
+                        } else {
+                            TaskState::Idle
+                        }
+                    } else {
+                        TaskState::Idle
+                    };
+
+                    // Update state tracking
+                    {
+                        let mut state_store = task_states.lock().unwrap();
+                        state_store.insert(span_id, task_state.clone());
+                    }
+
+                    let state_value = match task_state {
+                        TaskState::Idle => 0.0,
+                        TaskState::Running => 1.0,
+                        TaskState::Completed => 2.0,
+                    };
+
+                    metrics
+                        .task_state
                         .with_label_values(&[&metadata.name, &metadata.location, &metadata.kind])
-                        .set(state);
+                        .set(state_value);
                 } else {
                     // Task not in store - this should be rare now with persistent state
-                    debug!("Stats update for unknown span_id: {}. Creating placeholder.", span_id);
+                    debug!(
+                        "Stats update for unknown span_id: {}. Creating placeholder.",
+                        span_id
+                    );
 
                     // Create a minimal task metadata entry (using span_id like tokio-console)
                     let placeholder_metadata = TaskMetadata {
@@ -476,22 +616,33 @@ async fn scrape_console(
 
                     // Update metrics with the placeholder
                     if let Some(poll_stats) = &stats.poll_stats {
-                        let polls_counter = metrics.task_polls
-                            .with_label_values(&[&placeholder_metadata.name, &placeholder_metadata.location, &placeholder_metadata.kind]);
+                        let polls_counter = metrics.task_polls.with_label_values(&[
+                            &placeholder_metadata.name,
+                            &placeholder_metadata.location,
+                            &placeholder_metadata.kind,
+                        ]);
                         polls_counter.reset();
                         polls_counter.inc_by(poll_stats.polls as f64);
                     }
 
                     if stats.wakes > 0 {
-                        let wakes_counter = metrics.task_wakes
-                            .with_label_values(&[&placeholder_metadata.name, &placeholder_metadata.location, &placeholder_metadata.kind]);
+                        let wakes_counter = metrics.task_wakes.with_label_values(&[
+                            &placeholder_metadata.name,
+                            &placeholder_metadata.location,
+                            &placeholder_metadata.kind,
+                        ]);
                         wakes_counter.reset();
                         wakes_counter.inc_by(stats.wakes as f64);
                     }
 
                     let state = if stats.dropped_at.is_some() { 2.0 } else { 1.0 };
-                    metrics.task_state
-                        .with_label_values(&[&placeholder_metadata.name, &placeholder_metadata.location, &placeholder_metadata.kind])
+                    metrics
+                        .task_state
+                        .with_label_values(&[
+                            &placeholder_metadata.name,
+                            &placeholder_metadata.location,
+                            &placeholder_metadata.kind,
+                        ])
                         .set(state);
                 }
             }
@@ -511,38 +662,89 @@ async fn scrape_console(
 
         // Stop conditions - be more patient for comprehensive capture
         if updates_processed >= MAX_UPDATES {
-            debug!("Processed {} updates, stopping due to max limit", MAX_UPDATES);
+            debug!(
+                "Processed {} updates, stopping due to max limit",
+                MAX_UPDATES
+            );
             break;
         }
 
         if consecutive_empty_updates >= MAX_CONSECUTIVE_EMPTY {
-            debug!("Processed {} updates with {} consecutive empty, stopping",
-                   updates_processed, consecutive_empty_updates);
+            debug!(
+                "Processed {} updates with {} consecutive empty, stopping",
+                updates_processed, consecutive_empty_updates
+            );
             break;
         }
     }
 
     // Final metrics update
-    let (final_total, final_with_location, final_without_location) = {
+    let (
+        final_total,
+        final_with_location,
+        final_without_location,
+        running_count,
+        idle_count,
+        completed_count,
+    ) = {
         let store = task_metadata.lock().unwrap();
+        let state_store = task_states.lock().unwrap();
+
         let total = store.len();
-        let with_location = store.values()
+        let with_location = store
+            .values()
             .filter(|m| m.location != "unknown" && m.location != "no_location")
             .count();
         let without_location = total - with_location;
-        (total, with_location, without_location)
+
+        // Count tasks by state from our state tracking
+        let mut running_count = 0;
+        let mut idle_count = 0;
+        let mut completed_count = 0;
+
+        for (span_id, _) in store.iter() {
+            if let Some(state) = state_store.get(span_id) {
+                match state {
+                    TaskState::Running => running_count += 1,
+                    TaskState::Idle => idle_count += 1,
+                    TaskState::Completed => completed_count += 1,
+                }
+            } else {
+                // If no state info, assume idle
+                idle_count += 1;
+            }
+        }
+
+        (
+            total,
+            with_location,
+            without_location,
+            running_count,
+            idle_count,
+            completed_count,
+        )
     };
 
     metrics.tasks_total.set(final_total as i64);
     metrics.tasks_with_location.set(final_with_location as i64);
-    metrics.tasks_without_location.set(final_without_location as i64);
+    metrics
+        .tasks_without_location
+        .set(final_without_location as i64);
+    metrics.tasks_running.set(running_count as i64);
+    metrics.tasks_idle.set(idle_count as i64);
+    metrics.tasks_completed.set(completed_count as i64);
 
     // Final summary (using span_id as the key like tokio-console)
     {
         let store = task_metadata.lock().unwrap();
-        info!("Persistent task capture session complete: {} total tasks", final_total);
-        info!("Tasks with location: {}, without location: {}",
-              final_with_location, final_without_location);
+        info!(
+            "Persistent task capture session complete: {} total tasks",
+            final_total
+        );
+        info!(
+            "Tasks with location: {}, without location: {}",
+            final_with_location, final_without_location
+        );
 
         // Show breakdown by task kind
         let mut kind_counts: HashMap<String, usize> = HashMap::new();
@@ -552,7 +754,8 @@ async fn scrape_console(
         info!("Task breakdown by kind: {:?}", kind_counts);
 
         // Show sample of well-located tasks
-        let well_located_samples: Vec<_> = store.values()
+        let well_located_samples: Vec<_> = store
+            .values()
             .filter(|m| m.location != "unknown" && m.location != "no_location")
             .take(5)
             .map(|m| format!("{}@{}", m.name, m.location))
@@ -562,17 +765,27 @@ async fn scrape_console(
         }
     }
 
-    Ok((final_total, final_with_location, final_without_location))
+    Ok((
+        final_total,
+        final_with_location,
+        final_without_location,
+        running_count,
+        idle_count,
+        completed_count,
+    ))
 }
 
 fn update_summary_metrics(metrics: &Metrics, task_metadata: &TaskMetadataStore) {
     let store = task_metadata.lock().unwrap();
     let total = store.len();
-    let with_location = store.values()
+    let with_location = store
+        .values()
         .filter(|m| m.location != "unknown" && m.location != "no_location")
         .count();
     let without_location = total - with_location;
 
+    // Count tasks by state (we need to track this from the stats updates)
+    // For now, we'll set placeholder values - the actual state counting will be done in scrape_console
     metrics.tasks_total.set(total as i64);
     metrics.tasks_with_location.set(with_location as i64);
     metrics.tasks_without_location.set(without_location as i64);
@@ -583,7 +796,7 @@ mod tests {
     use super::*;
     use console_api::field::{Name, Value};
     use console_api::tasks::Task;
-    use console_api::{Location, MetaId, Field};
+    use console_api::{Field, Location, MetaId};
 
     // Helper function to create a basic test task
     fn create_test_task() -> Task {
@@ -617,7 +830,10 @@ mod tests {
         });
 
         let metadata = extract_task_metadata(&task);
-        assert_eq!(metadata.location, "/src/runtime/scheduler/multi_thread/worker.rs:457");
+        assert_eq!(
+            metadata.location,
+            "/src/runtime/scheduler/multi_thread/worker.rs:457"
+        );
     }
 
     #[test]
@@ -643,7 +859,7 @@ mod tests {
         // Add location in fields (this won't be used in new implementation)
         task.fields.push(create_field(
             "src.location",
-            Value::StrVal("worker.rs:123".to_string())
+            Value::StrVal("worker.rs:123".to_string()),
         ));
 
         let metadata = extract_task_metadata(&task);
@@ -657,7 +873,7 @@ mod tests {
 
         task.fields.push(create_field(
             "file",
-            Value::StrVal("/home/user/project/src/lib.rs:45".to_string())
+            Value::StrVal("/home/user/project/src/lib.rs:45".to_string()),
         ));
 
         let metadata = extract_task_metadata(&task);
@@ -672,7 +888,7 @@ mod tests {
         // Add a field with location-like pattern (won't be used)
         task.fields.push(create_field(
             "spawn.location",
-            Value::StrVal("common/task/src/cancellation.rs:232:17".to_string())
+            Value::StrVal("common/task/src/cancellation.rs:232:17".to_string()),
         ));
 
         let metadata = extract_task_metadata(&task);
@@ -687,7 +903,10 @@ mod tests {
         // Add a field with cargo path pattern (won't be used)
         task.fields.push(create_field(
             "loc",
-            Value::StrVal("<cargo>/tokio-1.46.1/src/runtime/scheduler/multi_thread/worker.rs:457:13".to_string())
+            Value::StrVal(
+                "<cargo>/tokio-1.46.1/src/runtime/scheduler/multi_thread/worker.rs:457:13"
+                    .to_string(),
+            ),
         ));
 
         let metadata = extract_task_metadata(&task);
@@ -717,15 +936,24 @@ mod tests {
 
         // Add fields
         task.fields.push(create_field("task.id", Value::U64Val(42)));
-        task.fields.push(create_field("task.name", Value::StrVal("my_task".to_string())));
-        task.fields.push(create_field("task.kind", Value::StrVal("blocking".to_string())));
+        task.fields.push(create_field(
+            "task.name",
+            Value::StrVal("my_task".to_string()),
+        ));
+        task.fields.push(create_field(
+            "task.kind",
+            Value::StrVal("blocking".to_string()),
+        ));
 
         let metadata = extract_task_metadata(&task);
 
         assert_eq!(metadata.task_id, 42);
         assert_eq!(metadata.name, "42 (my_task)"); // tokio-console format: "task_id (name)"
         assert_eq!(metadata.kind, "blocking");
-        assert_eq!(metadata.location, "/src/runtime/scheduler/multi_thread/worker.rs:457");
+        assert_eq!(
+            metadata.location,
+            "/src/runtime/scheduler/multi_thread/worker.rs:457"
+        );
     }
 
     #[test]
@@ -753,8 +981,10 @@ mod tests {
     fn test_extract_task_metadata_without_location() {
         let mut task = create_test_task();
 
-        task.fields.push(create_field("task.id", Value::U64Val(123)));
-        task.fields.push(create_field("task.kind", Value::StrVal("task".to_string())));
+        task.fields
+            .push(create_field("task.id", Value::U64Val(123)));
+        task.fields
+            .push(create_field("task.kind", Value::StrVal("task".to_string())));
 
         let metadata = extract_task_metadata(&task);
 
@@ -831,9 +1061,7 @@ mod tests {
 
         // Verify the metrics are properly registered
         let gathered = registry.gather();
-        let metric_names: Vec<String> = gathered.iter()
-            .map(|m| m.name().to_string())
-            .collect();
+        let metric_names: Vec<String> = gathered.iter().map(|m| m.name().to_string()).collect();
 
         assert!(metric_names.contains(&"tokio_tasks_total".to_string()));
         assert!(metric_names.contains(&"tokio_tasks_with_location".to_string()));
@@ -856,7 +1084,8 @@ mod tests {
 
         // Gather and verify both label sets exist
         let gathered = registry.gather();
-        let task_polls_family = gathered.iter()
+        let task_polls_family = gathered
+            .iter()
             .find(|m| m.name() == "tokio_task_polls_total")
             .expect("task_polls metric should exist");
 
@@ -896,7 +1125,6 @@ mod tests {
     #[tokio::test]
     async fn test_scrape_loop_interval() {
         use std::time::Instant;
-
 
         // Create a mock interval of 1 second
         let mut interval_timer = tokio::time::interval(Duration::from_millis(100));

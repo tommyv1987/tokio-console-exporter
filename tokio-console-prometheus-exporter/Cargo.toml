@@ -1,6 +1,6 @@
 [package]
 name = "tokio-console-exporter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Tommy Verrall"]
 description = "Prometheus exporter for Tokio Console metrics with enhanced task location tracking"
