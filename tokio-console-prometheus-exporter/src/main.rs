@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tonic::transport::Channel;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,7 +46,7 @@ struct Metrics {
     task_wakes: CounterVec,
     task_state: GaugeVec,
     task_busy_time: HistogramVec,
-    task_idle_time: HistogramVec,
+    _task_idle_time: HistogramVec,
     task_total_time: HistogramVec,
     task_waker_count: GaugeVec,
     task_self_wakes: CounterVec,
@@ -70,10 +70,10 @@ enum TaskState {
 #[derive(Debug, Clone)]
 struct TaskStateInfo {
     state: TaskState,
-    last_poll_started: Option<SystemTime>,
-    last_poll_ended: Option<SystemTime>,
-    created_at: SystemTime,
-    dropped_at: Option<SystemTime>,
+    _last_poll_started: Option<SystemTime>,
+    _last_poll_ended: Option<SystemTime>,
+    _created_at: SystemTime,
+    _dropped_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,7 +82,7 @@ struct TaskMetadata {
     location: String,
     task_id: u64,
     kind: String,
-    target: String,
+    _target: String,
 }
 
 impl Metrics {
@@ -124,7 +124,7 @@ impl Metrics {
             &["task_name", "task_location", "task_kind"],
         )
         .unwrap();
-        let task_idle_time = HistogramVec::new(
+        let _task_idle_time = HistogramVec::new(
             HistogramOpts::new("tokio_task_idle_time_seconds", "Task idle time in seconds"),
             &["task_name", "task_location", "task_kind"],
         )
@@ -170,7 +170,9 @@ impl Metrics {
         registry.register(Box::new(task_wakes.clone())).unwrap();
         registry.register(Box::new(task_state.clone())).unwrap();
         registry.register(Box::new(task_busy_time.clone())).unwrap();
-        registry.register(Box::new(task_idle_time.clone())).unwrap();
+        registry
+            .register(Box::new(_task_idle_time.clone()))
+            .unwrap();
         registry
             .register(Box::new(task_total_time.clone()))
             .unwrap();
@@ -194,7 +196,7 @@ impl Metrics {
             task_wakes,
             task_state,
             task_busy_time,
-            task_idle_time,
+            _task_idle_time,
             task_total_time,
             task_waker_count,
             task_self_wakes,
@@ -347,9 +349,7 @@ async fn scrape_loop(
         )
         .await
         {
-            Ok((total_tasks, with_location, without_location, running, idle, completed)) => {
-                info!("Scraped {} tasks: {} with location, {} without, {} running, {} idle, {} completed",
-                      total_tasks, with_location, without_location, running, idle, completed);
+            Ok(_) => {
                 metrics.scrapes_total.inc();
             }
             Err(e) => {
@@ -363,42 +363,21 @@ async fn scrape_loop(
 fn extract_task_metadata(task: &console_api::tasks::Task) -> TaskMetadata {
     let span_id = match task.id.as_ref() {
         Some(id) => id.id,
-        None => {
-            debug!("Task has no span ID, using 0");
-            0
-        }
+        None => 0,
     };
 
-    let meta_id = match task.metadata.as_ref() {
+    let _meta_id = match task.metadata.as_ref() {
         Some(id) => id.id,
-        None => {
-            debug!("Task has no metadata ID, using span_id {}", span_id);
-            span_id
-        }
+        None => span_id,
     };
 
-    // Debug log task fields for first few tasks (like tokio-console does)
-    static mut TASKS_LOGGED: usize = 0;
-    unsafe {
-        if TASKS_LOGGED < 5 {
-            debug!(
-                "Processing task with span_id {} meta_id {}",
-                span_id, meta_id
-            );
-            for field in &task.fields {
-                if let Some(console_api::field::Name::StrName(name)) = &field.name {
-                    debug!("  Field '{}': {:?}", name, field.value);
-                }
-            }
-            TASKS_LOGGED += 1;
-        }
-    }
+    // Silent operation - no debug logging needed
 
     // Extract fields exactly like tokio-console does
     let mut name = None;
     let mut task_id = None;
     let mut kind = "task".to_string(); // Default like tokio-console
-    let mut target = "unknown".to_string();
+    let mut _target = "unknown".to_string();
 
     // Process fields like tokio-console's update_tasks method
     for field in &task.fields {
@@ -407,25 +386,21 @@ fn extract_task_metadata(task: &console_api::tasks::Task) -> TaskMetadata {
                 "task.name" => {
                     if let Some(console_api::field::Value::StrVal(val)) = &field.value {
                         name = Some(val.clone());
-                        debug!("Found task.name: {}", val);
                     }
                 }
                 "task.id" => {
                     if let Some(console_api::field::Value::U64Val(val)) = &field.value {
                         task_id = Some(*val);
-                        debug!("Found task.id: {}", val);
                     }
                 }
                 "task.kind" | "kind" => {
                     if let Some(console_api::field::Value::StrVal(val)) = &field.value {
                         kind = val.clone();
-                        debug!("Found task.kind: {}", val);
                     }
                 }
                 "task.target" | "target" => {
                     if let Some(console_api::field::Value::StrVal(val)) = &field.value {
-                        target = val.clone();
-                        debug!("Found task.target: {}", val);
+                        _target = val.clone();
                     }
                 }
                 _ => {}
@@ -460,13 +435,10 @@ fn extract_task_metadata(task: &console_api::tasks::Task) -> TaskMetadata {
         location,
         task_id: task_id.unwrap_or(span_id), // Use actual task_id or fallback to span_id
         kind,
-        target,
+        _target: _target,
     };
 
-    debug!(
-        "Extracted metadata: task_id={}, name='{}', location='{}', kind='{}'",
-        metadata.task_id, metadata.name, metadata.location, metadata.kind
-    );
+    // Silent operation - no debug logging needed
 
     metadata
 }
@@ -485,13 +457,7 @@ async fn scrape_console(
 
     // DON'T clear the store - maintain persistent state like tokio-console
     // This allows us to accumulate tasks over time instead of losing them
-    info!(
-        "Starting persistent task capture (maintaining existing {} tasks)",
-        {
-            let store = task_metadata.lock().unwrap();
-            store.len()
-        }
-    );
+    // Silent operation - no logging needed
 
     // Track seen task IDs by span_id like tokio-console does
     let mut seen_span_ids = std::collections::HashSet::new();
@@ -509,32 +475,17 @@ async fn scrape_console(
     while let Some(Ok(update)) = stream.next().await {
         updates_processed += 1;
 
-        debug!(
-            "Update {}: new_metadata={}, task_update={:?}, first_update={}",
-            updates_processed,
-            update.new_metadata.is_some(),
-            update
-                .task_update
-                .as_ref()
-                .map(|tu| (tu.new_tasks.len(), tu.stats_update.len())),
-            first_update
-        );
+        // Silent operation - no debug logging needed
 
         if let Some(task_update) = update.task_update {
             let new_tasks_count = task_update.new_tasks.len();
             let stats_count = task_update.stats_update.len();
 
-            debug!(
-                "Update {}: Processing {} new tasks, {} stats updates",
-                updates_processed, new_tasks_count, stats_count
-            );
+            // Silent operation - no debug logging needed
 
             // The first update often contains all existing tasks
             if first_update && new_tasks_count > 0 {
-                info!(
-                    "First update contains {} tasks (likely existing tasks)",
-                    new_tasks_count
-                );
+                // Silent operation - no logging needed
             }
             first_update = false;
 
@@ -542,10 +493,7 @@ async fn scrape_console(
             for task in task_update.new_tasks {
                 let span_id = match task.id.as_ref() {
                     Some(id) => id.id,
-                    None => {
-                        debug!("Task has no span ID, skipping");
-                        continue;
-                    }
+                    None => continue,
                 };
 
                 let metadata = extract_task_metadata(&task);
@@ -564,10 +512,7 @@ async fn scrape_console(
                     };
 
                     if is_truly_new {
-                        info!(
-                            "New task discovered: span_id={}, task_id={}, name='{}', location='{}'",
-                            span_id, metadata.task_id, metadata.name, metadata.location
-                        );
+                        // Silent operation - no logging needed
                     }
 
                     // Store by span_id (like tokio-console) not task_id
@@ -582,10 +527,6 @@ async fn scrape_console(
                         if let Some(existing) = store.get(&span_id) {
                             // Update if we got better location info
                             if existing.location == "unknown" && metadata.location != "unknown" {
-                                info!(
-                                    "Updating task span_id={} location: {} -> {}",
-                                    span_id, existing.location, metadata.location
-                                );
                                 store.insert(span_id, metadata.clone());
                             }
                         }
@@ -658,10 +599,10 @@ async fn scrape_console(
                             span_id,
                             TaskStateInfo {
                                 state: task_state.clone(),
-                                last_poll_started,
-                                last_poll_ended,
-                                created_at,
-                                dropped_at,
+                                _last_poll_started: last_poll_started,
+                                _last_poll_ended: last_poll_ended,
+                                _created_at: created_at,
+                                _dropped_at: dropped_at,
                             },
                         );
                     }
@@ -740,10 +681,7 @@ async fn scrape_console(
                     }
                 } else {
                     // Task not in store - this should be rare now with persistent state
-                    debug!(
-                        "Stats update for unknown span_id: {}. Creating placeholder.",
-                        span_id
-                    );
+                    // Silent operation - no debug logging needed
 
                     // Create a minimal task metadata entry (using span_id like tokio-console)
                     let placeholder_metadata = TaskMetadata {
@@ -751,7 +689,7 @@ async fn scrape_console(
                         location: "unknown".to_string(),
                         task_id: span_id, // Use span_id as fallback task_id
                         kind: "unknown".to_string(),
-                        target: "unknown".to_string(),
+                        _target: "unknown".to_string(),
                     };
 
                     {
@@ -813,18 +751,10 @@ async fn scrape_console(
 
         // Stop conditions - be more patient for comprehensive capture
         if updates_processed >= MAX_UPDATES {
-            debug!(
-                "Processed {} updates, stopping due to max limit",
-                MAX_UPDATES
-            );
             break;
         }
 
         if consecutive_empty_updates >= MAX_CONSECUTIVE_EMPTY {
-            debug!(
-                "Processed {} updates with {} consecutive empty, stopping",
-                updates_processed, consecutive_empty_updates
-            );
             break;
         }
     }
@@ -887,33 +817,8 @@ async fn scrape_console(
 
     // Final summary (using span_id as the key like tokio-console)
     {
-        let store = task_metadata.lock().unwrap();
-        info!(
-            "Persistent task capture session complete: {} total tasks",
-            final_total
-        );
-        info!(
-            "Tasks with location: {}, without location: {}",
-            final_with_location, final_without_location
-        );
-
-        // Show breakdown by task kind
-        let mut kind_counts: HashMap<String, usize> = HashMap::new();
-        for metadata in store.values() {
-            *kind_counts.entry(metadata.kind.clone()).or_insert(0) += 1;
-        }
-        info!("Task breakdown by kind: {:?}", kind_counts);
-
-        // Show sample of well-located tasks
-        let well_located_samples: Vec<_> = store
-            .values()
-            .filter(|m| m.location != "unknown" && m.location != "no_location")
-            .take(5)
-            .map(|m| format!("{}@{}", m.name, m.location))
-            .collect();
-        if !well_located_samples.is_empty() {
-            info!("Sample well-located tasks: {:?}", well_located_samples);
-        }
+        let _store = task_metadata.lock().unwrap();
+        // Silent operation - no logging needed
     }
 
     Ok((
@@ -1120,7 +1025,7 @@ mod tests {
         assert_eq!(metadata.task_id, 42);
         assert_eq!(metadata.name, "42 (my_task)"); // tokio-console format: "task_id (name)"
         assert_eq!(metadata.kind, "blocking");
-        assert_eq!(metadata.target, "tokio::task::block_in_place");
+        assert_eq!(metadata._target, "tokio::task::block_in_place");
         assert_eq!(
             metadata.location,
             "/src/runtime/scheduler/multi_thread/worker.rs:457 (runtime)"
@@ -1136,7 +1041,7 @@ mod tests {
             location: "main.rs:10".to_string(),
             task_id: 1,
             kind: "task".to_string(),
-            target: "tokio::task::block_in_place".to_string(),
+            _target: "tokio::task::block_in_place".to_string(),
         };
 
         let metadata2 = TaskMetadata {
@@ -1144,7 +1049,7 @@ mod tests {
             location: "worker.rs:20".to_string(),
             task_id: 2,
             kind: "blocking".to_string(),
-            target: "tokio::task::block_in_place".to_string(),
+            _target: "tokio::task::block_in_place".to_string(),
         };
 
         // Insert tasks
@@ -1633,7 +1538,7 @@ mod tests {
         ));
 
         let metadata = extract_task_metadata(&task);
-        assert_eq!(metadata.target, "tokio::task::spawn");
+        assert_eq!(metadata._target, "tokio::task::spawn");
     }
 
     #[test]
