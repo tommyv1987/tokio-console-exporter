@@ -34,8 +34,6 @@ struct Args {
     auth_token: Option<String>,
     #[arg(long, default_value = "1000")]
     max_tasks: usize,
-    #[arg(long, action = clap::ArgAction::SetTrue, default_value = "true")]
-    enable_detailed_metrics: bool,
 }
 
 #[derive(Debug)]
