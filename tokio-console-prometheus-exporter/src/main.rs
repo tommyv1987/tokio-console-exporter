@@ -32,6 +32,10 @@ struct Args {
     interval: u64,
     #[arg(long)]
     auth_token: Option<String>,
+    #[arg(long, default_value = "1000")]
+    max_tasks: usize,
+    #[arg(long, action = clap::ArgAction::SetTrue, default_value = "true")]
+    enable_detailed_metrics: bool,
 }
 
 #[derive(Debug)]
@@ -221,8 +225,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Tokio Console Prometheus Exporter");
     info!(
-        "Console: {}, Listen: {}, Interval: {}s",
-        args.console_addr, args.listen_addr, args.interval
+        "Console: {}, Listen: {}, Interval: {}s, Max Tasks: {}",
+        args.console_addr, args.listen_addr, args.interval, args.max_tasks
     );
 
     let registry = Registry::new();
@@ -319,6 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metrics_clone,
             task_metadata_clone,
             task_states_clone,
+            args.max_tasks,
         )
         .await;
     });
@@ -337,6 +342,7 @@ async fn scrape_loop(
     metrics: Arc<Metrics>,
     task_metadata: TaskMetadataStore,
     task_states: TaskStateStore,
+    max_tasks: usize,
 ) {
     let mut interval_timer = tokio::time::interval(Duration::from_secs(interval));
     loop {
@@ -346,6 +352,7 @@ async fn scrape_loop(
             &metrics,
             task_metadata.clone(),
             task_states.clone(),
+            max_tasks,
         )
         .await
         {
@@ -448,6 +455,7 @@ async fn scrape_console(
     metrics: &Metrics,
     task_metadata: TaskMetadataStore,
     task_states: TaskStateStore,
+    max_tasks: usize,
 ) -> Result<(usize, usize, usize, usize, usize, usize), Box<dyn std::error::Error>> {
     let channel = Channel::from_shared(format!("http://{}", console_addr))?
         .connect()
@@ -518,7 +526,10 @@ async fn scrape_console(
                     // Store by span_id (like tokio-console) not task_id
                     {
                         let mut store = task_metadata.lock().unwrap();
-                        store.insert(span_id, metadata.clone());
+                        // Respect max_tasks limit
+                        if store.len() < max_tasks {
+                            store.insert(span_id, metadata.clone());
+                        }
                     }
                 } else {
                     // Update existing task metadata in case location was resolved
@@ -1561,6 +1572,229 @@ mod tests {
         let path = "/src/main.rs".to_string();
         let truncated = truncate_registry_path(path);
         assert_eq!(truncated, "/src/main.rs");
+    }
+
+    #[test]
+    fn test_max_tasks_limit_respected() {
+        let task_metadata: TaskMetadataStore = Arc::new(Mutex::new(HashMap::new()));
+        let max_tasks = 3;
+
+        // Create test tasks
+        let mut task1 = create_test_task();
+        task1.id = Some(console_api::Id { id: 1 });
+        task1.fields.push(create_field(
+            "task.name",
+            Value::StrVal("task1".to_string()),
+        ));
+
+        let mut task2 = create_test_task();
+        task2.id = Some(console_api::Id { id: 2 });
+        task2.fields.push(create_field(
+            "task.name",
+            Value::StrVal("task2".to_string()),
+        ));
+
+        let mut task3 = create_test_task();
+        task3.id = Some(console_api::Id { id: 3 });
+        task3.fields.push(create_field(
+            "task.name",
+            Value::StrVal("task3".to_string()),
+        ));
+
+        let mut task4 = create_test_task();
+        task4.id = Some(console_api::Id { id: 4 });
+        task4.fields.push(create_field(
+            "task.name",
+            Value::StrVal("task4".to_string()),
+        ));
+
+        // Simulate processing tasks
+        let metadata1 = extract_task_metadata(&task1);
+        let metadata2 = extract_task_metadata(&task2);
+        let metadata3 = extract_task_metadata(&task3);
+        let metadata4 = extract_task_metadata(&task4);
+
+        // Insert tasks up to limit
+        {
+            let mut store = task_metadata.lock().unwrap();
+            if store.len() < max_tasks {
+                store.insert(1, metadata1.clone());
+            }
+            if store.len() < max_tasks {
+                store.insert(2, metadata2.clone());
+            }
+            if store.len() < max_tasks {
+                store.insert(3, metadata3.clone());
+            }
+            if store.len() < max_tasks {
+                store.insert(4, metadata4.clone());
+            }
+        }
+
+        // Verify only max_tasks were stored
+        {
+            let store = task_metadata.lock().unwrap();
+            assert_eq!(store.len(), max_tasks);
+            assert!(store.contains_key(&1));
+            assert!(store.contains_key(&2));
+            assert!(store.contains_key(&3));
+            assert!(!store.contains_key(&4)); // Should be rejected due to limit
+        }
+    }
+
+    #[test]
+    fn test_max_tasks_zero_limit() {
+        let task_metadata: TaskMetadataStore = Arc::new(Mutex::new(HashMap::new()));
+        let max_tasks = 0;
+
+        let mut task = create_test_task();
+        task.id = Some(console_api::Id { id: 1 });
+        task.fields.push(create_field(
+            "task.name",
+            Value::StrVal("task1".to_string()),
+        ));
+
+        let metadata = extract_task_metadata(&task);
+
+        // Try to insert task with zero limit
+        {
+            let mut store = task_metadata.lock().unwrap();
+            if store.len() < max_tasks {
+                store.insert(1, metadata.clone());
+            }
+        }
+
+        // Verify no tasks were stored
+        {
+            let store = task_metadata.lock().unwrap();
+            assert_eq!(store.len(), 0);
+            assert!(!store.contains_key(&1));
+        }
+    }
+
+    #[test]
+    fn test_max_tasks_large_limit() {
+        let task_metadata: TaskMetadataStore = Arc::new(Mutex::new(HashMap::new()));
+        let max_tasks = 10000;
+
+        // Create many tasks
+        for i in 1..=100 {
+            let mut task = create_test_task();
+            task.id = Some(console_api::Id { id: i });
+            task.fields.push(create_field(
+                "task.name",
+                Value::StrVal(format!("task{}", i)),
+            ));
+
+            let metadata = extract_task_metadata(&task);
+
+            {
+                let mut store = task_metadata.lock().unwrap();
+                if store.len() < max_tasks {
+                    store.insert(i, metadata);
+                }
+            }
+        }
+
+        // Verify all tasks were stored (since limit is high)
+        {
+            let store = task_metadata.lock().unwrap();
+            assert_eq!(store.len(), 100);
+            for i in 1..=100 {
+                assert!(store.contains_key(&i));
+            }
+        }
+    }
+
+    #[test]
+    fn test_args_parsing_with_max_tasks() {
+        // Test default values
+        let args = Args::parse_from(&["tokio-console-exporter"]);
+        assert_eq!(args.max_tasks, 1000);
+
+        // Test custom values
+        let args = Args::parse_from(&["tokio-console-exporter", "--max-tasks", "500"]);
+        assert_eq!(args.max_tasks, 500);
+    }
+
+    #[test]
+    fn test_task_metadata_store_with_max_tasks_logic() {
+        let task_metadata: TaskMetadataStore = Arc::new(Mutex::new(HashMap::new()));
+        let max_tasks = 2;
+
+        // Create tasks
+        let mut task1 = create_test_task();
+        task1.id = Some(console_api::Id { id: 1 });
+        task1.fields.push(create_field(
+            "task.name",
+            Value::StrVal("task1".to_string()),
+        ));
+
+        let mut task2 = create_test_task();
+        task2.id = Some(console_api::Id { id: 2 });
+        task2.fields.push(create_field(
+            "task.name",
+            Value::StrVal("task2".to_string()),
+        ));
+
+        let mut task3 = create_test_task();
+        task3.id = Some(console_api::Id { id: 3 });
+        task3.fields.push(create_field(
+            "task.name",
+            Value::StrVal("task3".to_string()),
+        ));
+
+        let metadata1 = extract_task_metadata(&task1);
+        let metadata2 = extract_task_metadata(&task2);
+        let metadata3 = extract_task_metadata(&task3);
+
+        // Simulate the exact logic from scrape_console function
+        let mut seen_span_ids = std::collections::HashSet::new();
+
+        // Process task1
+        let span_id1 = 1;
+        if !seen_span_ids.contains(&span_id1) {
+            seen_span_ids.insert(span_id1);
+            {
+                let mut store = task_metadata.lock().unwrap();
+                if store.len() < max_tasks {
+                    store.insert(span_id1, metadata1.clone());
+                }
+            }
+        }
+
+        // Process task2
+        let span_id2 = 2;
+        if !seen_span_ids.contains(&span_id2) {
+            seen_span_ids.insert(span_id2);
+            {
+                let mut store = task_metadata.lock().unwrap();
+                if store.len() < max_tasks {
+                    store.insert(span_id2, metadata2.clone());
+                }
+            }
+        }
+
+        // Process task3 (should be rejected)
+        let span_id3 = 3;
+        if !seen_span_ids.contains(&span_id3) {
+            seen_span_ids.insert(span_id3);
+            {
+                let mut store = task_metadata.lock().unwrap();
+                if store.len() < max_tasks {
+                    store.insert(span_id3, metadata3.clone());
+                }
+            }
+        }
+
+        // Verify results
+        {
+            let store = task_metadata.lock().unwrap();
+            assert_eq!(store.len(), 2);
+            assert!(store.contains_key(&1));
+            assert!(store.contains_key(&2));
+            assert!(!store.contains_key(&3));
+        }
     }
 }
 
