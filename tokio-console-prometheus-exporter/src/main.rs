@@ -64,9 +64,9 @@ type TaskStateStore = Arc<Mutex<HashMap<u64, TaskStateInfo>>>;
 
 #[derive(Debug, Clone)]
 enum TaskState {
+    Completed,
     Idle,
     Running,
-    Completed,
 }
 
 #[derive(Debug, Clone)]
@@ -546,6 +546,7 @@ async fn scrape_console(
             // Process stats updates for ALL tasks (exactly like tokio-console does)
             // Note: stats_update uses span_id as the key, not task_id
             for (span_id, stats) in task_update.stats_update {
+                eprintln!("DEBUG: Processing stats update for span_id {}", span_id);
                 // First check if we have this task in our store (by span_id)
                 let metadata = {
                     let store = task_metadata.lock().unwrap();
@@ -553,6 +554,7 @@ async fn scrape_console(
                 };
 
                 if let Some(metadata) = metadata {
+                    eprintln!("DEBUG: Found metadata for span_id {}, setting task_state metric", span_id);
                     // Update metrics for this task
                     if let Some(poll_stats) = &stats.poll_stats {
                         let polls_counter = metrics.task_polls.with_label_values(&[
@@ -617,9 +619,9 @@ async fn scrape_console(
                     }
 
                     let state_value = match task_state {
+                        TaskState::Completed => 0.0, // 0 = Completed
                         TaskState::Idle => 1.0,      // 1 = Idle
                         TaskState::Running => 2.0,   // 2 = Running
-                        TaskState::Completed => 0.0, // 0 = Completed
                     };
 
                     let state_label = match task_state {
@@ -689,6 +691,7 @@ async fn scrape_console(
                             .inc_by(stats.self_wakes as f64);
                     }
                 } else {
+                    eprintln!("WARNING: Stats update for span_id {} but task not in metadata store", span_id);
                     // Task not in store - this should be rare now with persistent state
                     // Silent operation - no debug logging needed
 
@@ -840,26 +843,23 @@ async fn scrape_console(
     ))
 }
 
-/// Determine task state using tokio-console's logic
+/// Determine task state using sd2k's logic (matching tokio-console)
 fn determine_task_state(stats: &console_api::tasks::Stats) -> TaskState {
-    // If task is dropped, it's completed
+    // Check if task is completed (has dropped_at timestamp)
     if stats.dropped_at.is_some() {
         return TaskState::Completed;
     }
 
-    // Check if task is currently being polled
+    // Check if currently being polled (last_poll_started > last_poll_ended)
     if let Some(poll_stats) = &stats.poll_stats {
-        if let (Some(_last_poll_started), None) =
-            (poll_stats.last_poll_started, poll_stats.last_poll_ended)
-        {
-            // Task is currently being polled
-            return TaskState::Running;
-        }
-    }
-
-    // If task has been polled at least once, it's likely running
-    if let Some(poll_stats) = &stats.poll_stats {
-        if poll_stats.polls > 0 {
+        if let (Some(started), Some(ended)) = (poll_stats.last_poll_started.as_ref(), poll_stats.last_poll_ended.as_ref()) {
+            let started_time = protobuf_timestamp_to_system_time(started);
+            let ended_time = protobuf_timestamp_to_system_time(ended);
+            if started_time > ended_time {
+                return TaskState::Running;
+            }
+        } else if poll_stats.last_poll_started.is_some() && poll_stats.last_poll_ended.is_none() {
+            // Currently being polled (started but not ended)
             return TaskState::Running;
         }
     }
@@ -1148,47 +1148,47 @@ mod tests {
         let running_state = TaskState::Running;
         let completed_state = TaskState::Completed;
 
-        // Test state values (should match our fixed implementation)
+        // Test state values (should match our sd2k-aligned implementation)
         let idle_value = match idle_state {
+            TaskState::Completed => 0.0,
             TaskState::Idle => 1.0,
             TaskState::Running => 2.0,
-            TaskState::Completed => 0.0,
         };
         assert_eq!(idle_value, 1.0);
 
         let running_value = match running_state {
+            TaskState::Completed => 0.0,
             TaskState::Idle => 1.0,
             TaskState::Running => 2.0,
-            TaskState::Completed => 0.0,
         };
         assert_eq!(running_value, 2.0);
 
         let completed_value = match completed_state {
+            TaskState::Completed => 0.0,
             TaskState::Idle => 1.0,
             TaskState::Running => 2.0,
-            TaskState::Completed => 0.0,
         };
         assert_eq!(completed_value, 0.0);
 
         // Test state labels
         let idle_label = match idle_state {
+            TaskState::Completed => "completed".to_string(),
             TaskState::Idle => "idle".to_string(),
             TaskState::Running => "running".to_string(),
-            TaskState::Completed => "completed".to_string(),
         };
         assert_eq!(idle_label, "idle");
 
         let running_label = match running_state {
+            TaskState::Completed => "completed".to_string(),
             TaskState::Idle => "idle".to_string(),
             TaskState::Running => "running".to_string(),
-            TaskState::Completed => "completed".to_string(),
         };
         assert_eq!(running_label, "running");
 
         let completed_label = match completed_state {
+            TaskState::Completed => "completed".to_string(),
             TaskState::Idle => "idle".to_string(),
             TaskState::Running => "running".to_string(),
-            TaskState::Completed => "completed".to_string(),
         };
         assert_eq!(completed_label, "completed");
     }
@@ -1361,7 +1361,7 @@ mod tests {
         });
         assert!(matches!(determine_task_state(&stats), TaskState::Completed));
 
-        // Test running state - currently being polled
+        // Test running state - currently being polled (started but not ended)
         let mut stats = Stats::default();
         stats.poll_stats = Some(PollStats {
             last_poll_started: Some(Timestamp {
@@ -1375,7 +1375,41 @@ mod tests {
         });
         assert!(matches!(determine_task_state(&stats), TaskState::Running));
 
-        // Test running state - has been polled
+        // Test running state - last_poll_started > last_poll_ended (sd2k logic)
+        let mut stats = Stats::default();
+        stats.poll_stats = Some(PollStats {
+            last_poll_started: Some(Timestamp {
+                seconds: 1000,
+                nanos: 0,
+            }),
+            last_poll_ended: Some(Timestamp {
+                seconds: 999,
+                nanos: 0,
+            }),
+            polls: 5,
+            busy_time: None,
+            first_poll: None,
+        });
+        assert!(matches!(determine_task_state(&stats), TaskState::Running));
+
+        // Test idle state - last_poll_ended > last_poll_started (finished polling)
+        let mut stats = Stats::default();
+        stats.poll_stats = Some(PollStats {
+            last_poll_started: Some(Timestamp {
+                seconds: 999,
+                nanos: 0,
+            }),
+            last_poll_ended: Some(Timestamp {
+                seconds: 1000,
+                nanos: 0,
+            }),
+            polls: 1,
+            busy_time: None,
+            first_poll: None,
+        });
+        assert!(matches!(determine_task_state(&stats), TaskState::Idle));
+
+        // Test idle state - has been polled but no current polling
         let mut stats = Stats::default();
         stats.poll_stats = Some(PollStats {
             last_poll_started: None,
@@ -1384,7 +1418,7 @@ mod tests {
             busy_time: None,
             first_poll: None,
         });
-        assert!(matches!(determine_task_state(&stats), TaskState::Running));
+        assert!(matches!(determine_task_state(&stats), TaskState::Idle));
 
         // Test idle state - no polls
         let mut stats = Stats::default();
