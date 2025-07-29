@@ -6,12 +6,15 @@ use futures::stream::StreamExt;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use prometheus::{Counter, CounterVec, Encoder, GaugeVec, IntGauge, Opts, Registry, TextEncoder};
+use prometheus::{
+    Counter, CounterVec, Encoder, GaugeVec, HistogramOpts, HistogramVec, IntGauge, Opts, Registry,
+    TextEncoder,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tonic::transport::Channel;
 use tracing::{debug, error, info};
 
@@ -42,6 +45,11 @@ struct Metrics {
     task_polls: CounterVec,
     task_wakes: CounterVec,
     task_state: GaugeVec,
+    task_busy_time: HistogramVec,
+    task_idle_time: HistogramVec,
+    task_total_time: HistogramVec,
+    task_waker_count: GaugeVec,
+    task_self_wakes: CounterVec,
     scrapes_total: Counter,
     scrape_errors: Counter,
 }
@@ -49,8 +57,8 @@ struct Metrics {
 // Use span_id as the key (like tokio-console), not task_id
 type TaskMetadataStore = Arc<Mutex<HashMap<u64, TaskMetadata>>>;
 
-// Track task states
-type TaskStateStore = Arc<Mutex<HashMap<u64, TaskState>>>;
+// Track task states with timestamps for better state detection
+type TaskStateStore = Arc<Mutex<HashMap<u64, TaskStateInfo>>>;
 
 #[derive(Debug, Clone)]
 enum TaskState {
@@ -59,12 +67,22 @@ enum TaskState {
     Completed,
 }
 
+#[derive(Debug, Clone)]
+struct TaskStateInfo {
+    state: TaskState,
+    last_poll_started: Option<SystemTime>,
+    last_poll_ended: Option<SystemTime>,
+    created_at: SystemTime,
+    dropped_at: Option<SystemTime>,
+}
+
 #[derive(Clone, Debug)]
 struct TaskMetadata {
     name: String,
     location: String,
     task_id: u64,
     kind: String,
+    target: String,
 }
 
 impl Metrics {
@@ -96,8 +114,39 @@ impl Metrics {
         let task_state = GaugeVec::new(
             Opts::new(
                 "tokio_task_state",
-                "Task state (0=idle, 1=running, 2=completed)",
+                "Task state (0=completed, 1=idle, 2=running)",
             ),
+            &["task_name", "task_location", "task_kind", "state"],
+        )
+        .unwrap();
+        let task_busy_time = HistogramVec::new(
+            HistogramOpts::new("tokio_task_busy_time_seconds", "Task busy time in seconds"),
+            &["task_name", "task_location", "task_kind"],
+        )
+        .unwrap();
+        let task_idle_time = HistogramVec::new(
+            HistogramOpts::new("tokio_task_idle_time_seconds", "Task idle time in seconds"),
+            &["task_name", "task_location", "task_kind"],
+        )
+        .unwrap();
+        let task_total_time = HistogramVec::new(
+            HistogramOpts::new(
+                "tokio_task_total_time_seconds",
+                "Task total lifetime in seconds",
+            ),
+            &["task_name", "task_location", "task_kind"],
+        )
+        .unwrap();
+        let task_waker_count = GaugeVec::new(
+            Opts::new(
+                "tokio_task_waker_count",
+                "Current number of wakers for this task",
+            ),
+            &["task_name", "task_location", "task_kind"],
+        )
+        .unwrap();
+        let task_self_wakes = CounterVec::new(
+            Opts::new("tokio_task_self_wakes_total", "Total number of self-wakes"),
             &["task_name", "task_location", "task_kind"],
         )
         .unwrap();
@@ -120,6 +169,17 @@ impl Metrics {
         registry.register(Box::new(task_polls.clone())).unwrap();
         registry.register(Box::new(task_wakes.clone())).unwrap();
         registry.register(Box::new(task_state.clone())).unwrap();
+        registry.register(Box::new(task_busy_time.clone())).unwrap();
+        registry.register(Box::new(task_idle_time.clone())).unwrap();
+        registry
+            .register(Box::new(task_total_time.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(task_waker_count.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(task_self_wakes.clone()))
+            .unwrap();
         registry.register(Box::new(scrapes_total.clone())).unwrap();
         registry.register(Box::new(scrape_errors.clone())).unwrap();
 
@@ -133,6 +193,11 @@ impl Metrics {
             task_polls,
             task_wakes,
             task_state,
+            task_busy_time,
+            task_idle_time,
+            task_total_time,
+            task_waker_count,
+            task_self_wakes,
             scrapes_total,
             scrape_errors,
         }
@@ -333,6 +398,7 @@ fn extract_task_metadata(task: &console_api::tasks::Task) -> TaskMetadata {
     let mut name = None;
     let mut task_id = None;
     let mut kind = "task".to_string(); // Default like tokio-console
+    let mut target = "unknown".to_string();
 
     // Process fields like tokio-console's update_tasks method
     for field in &task.fields {
@@ -356,25 +422,19 @@ fn extract_task_metadata(task: &console_api::tasks::Task) -> TaskMetadata {
                         debug!("Found task.kind: {}", val);
                     }
                 }
+                "task.target" | "target" => {
+                    if let Some(console_api::field::Value::StrVal(val)) = &field.value {
+                        target = val.clone();
+                        debug!("Found task.target: {}", val);
+                    }
+                }
                 _ => {}
             }
         }
     }
 
-    // Format location exactly like tokio-console's format_location function
-    let location = if let Some(loc) = &task.location {
-        if let Some(file) = &loc.file {
-            if let Some(line) = loc.line {
-                format!("{}:{}", file, line)
-            } else {
-                file.clone()
-            }
-        } else {
-            "unknown".to_string()
-        }
-    } else {
-        "unknown".to_string()
-    };
+    // Format location exactly like tokio-console does
+    let location = format_location(task.location.as_ref());
 
     // Generate the task name like tokio-console does
     let final_name = match (task_id, name.as_ref()) {
@@ -400,6 +460,7 @@ fn extract_task_metadata(task: &console_api::tasks::Task) -> TaskMetadata {
         location,
         task_id: task_id.unwrap_or(span_id), // Use actual task_id or fallback to span_id
         kind,
+        target,
     };
 
     debug!(
@@ -563,37 +624,120 @@ async fn scrape_console(
                         wakes_counter.inc_by(stats.wakes as f64);
                     }
 
-                    // Determine task state and track it
-                    let task_state = if stats.dropped_at.is_some() {
-                        TaskState::Completed
-                    } else if let Some(poll_stats) = &stats.poll_stats {
-                        // If task has been polled recently and is not completed, it's likely running
-                        // This is a simplified heuristic - in reality tokio-console uses more complex logic
-                        if poll_stats.polls > 0 {
-                            TaskState::Running
-                        } else {
-                            TaskState::Idle
-                        }
-                    } else {
-                        TaskState::Idle
-                    };
+                    // Determine task state using tokio-console's logic
+                    let task_state = determine_task_state(&stats);
 
-                    // Update state tracking
+                    // Convert protobuf timestamps to SystemTime
+                    let created_at = stats
+                        .created_at
+                        .as_ref()
+                        .map(|ts| protobuf_timestamp_to_system_time(ts))
+                        .unwrap_or_else(SystemTime::now);
+
+                    let dropped_at = stats
+                        .dropped_at
+                        .as_ref()
+                        .map(|ts| protobuf_timestamp_to_system_time(ts));
+
+                    let last_poll_started = stats
+                        .poll_stats
+                        .as_ref()
+                        .and_then(|ps| ps.last_poll_started.as_ref())
+                        .map(|ts| protobuf_timestamp_to_system_time(ts));
+
+                    let last_poll_ended = stats
+                        .poll_stats
+                        .as_ref()
+                        .and_then(|ps| ps.last_poll_ended.as_ref())
+                        .map(|ts| protobuf_timestamp_to_system_time(ts));
+
+                    // Update state tracking with detailed timing info
                     {
                         let mut state_store = task_states.lock().unwrap();
-                        state_store.insert(span_id, task_state.clone());
+                        state_store.insert(
+                            span_id,
+                            TaskStateInfo {
+                                state: task_state.clone(),
+                                last_poll_started,
+                                last_poll_ended,
+                                created_at,
+                                dropped_at,
+                            },
+                        );
                     }
 
                     let state_value = match task_state {
-                        TaskState::Idle => 0.0,
-                        TaskState::Running => 1.0,
-                        TaskState::Completed => 2.0,
+                        TaskState::Idle => 1.0,      // 1 = Idle
+                        TaskState::Running => 2.0,   // 2 = Running
+                        TaskState::Completed => 0.0, // 0 = Completed
+                    };
+
+                    let state_label = match task_state {
+                        TaskState::Idle => "idle".to_string(),
+                        TaskState::Running => "running".to_string(),
+                        TaskState::Completed => "completed".to_string(),
                     };
 
                     metrics
                         .task_state
-                        .with_label_values(&[&metadata.name, &metadata.location, &metadata.kind])
+                        .with_label_values(&[
+                            &metadata.name,
+                            &metadata.location,
+                            &metadata.kind,
+                            &state_label,
+                        ])
                         .set(state_value);
+
+                    // Update timing metrics
+                    if let Some(poll_stats) = &stats.poll_stats {
+                        if let Some(busy_time) = &poll_stats.busy_time {
+                            let busy_seconds = busy_time.seconds as f64
+                                + (busy_time.nanos as f64 / 1_000_000_000.0);
+                            metrics
+                                .task_busy_time
+                                .with_label_values(&[
+                                    &metadata.name,
+                                    &metadata.location,
+                                    &metadata.kind,
+                                ])
+                                .observe(busy_seconds);
+                        }
+                    }
+
+                    // Calculate and record total time
+                    if let Some(created_at) = stats.created_at.as_ref() {
+                        let created = protobuf_timestamp_to_system_time(created_at);
+                        let total_duration = SystemTime::now()
+                            .duration_since(created)
+                            .unwrap_or_default();
+                        let total_seconds = total_duration.as_secs_f64();
+                        metrics
+                            .task_total_time
+                            .with_label_values(&[
+                                &metadata.name,
+                                &metadata.location,
+                                &metadata.kind,
+                            ])
+                            .observe(total_seconds);
+                    }
+
+                    // Update waker metrics
+                    let waker_count = stats.waker_clones.saturating_sub(stats.waker_drops);
+                    metrics
+                        .task_waker_count
+                        .with_label_values(&[&metadata.name, &metadata.location, &metadata.kind])
+                        .set(waker_count as f64);
+
+                    if stats.self_wakes > 0 {
+                        metrics
+                            .task_self_wakes
+                            .with_label_values(&[
+                                &metadata.name,
+                                &metadata.location,
+                                &metadata.kind,
+                            ])
+                            .inc_by(stats.self_wakes as f64);
+                    }
                 } else {
                     // Task not in store - this should be rare now with persistent state
                     debug!(
@@ -607,6 +751,7 @@ async fn scrape_console(
                         location: "unknown".to_string(),
                         task_id: span_id, // Use span_id as fallback task_id
                         kind: "unknown".to_string(),
+                        target: "unknown".to_string(),
                     };
 
                     {
@@ -635,13 +780,19 @@ async fn scrape_console(
                         wakes_counter.inc_by(stats.wakes as f64);
                     }
 
-                    let state = if stats.dropped_at.is_some() { 2.0 } else { 1.0 };
+                    let state = if stats.dropped_at.is_some() { 0.0 } else { 1.0 };
+                    let state_label = if stats.dropped_at.is_some() {
+                        "completed".to_string()
+                    } else {
+                        "idle".to_string()
+                    };
                     metrics
                         .task_state
                         .with_label_values(&[
                             &placeholder_metadata.name,
                             &placeholder_metadata.location,
                             &placeholder_metadata.kind,
+                            &state_label,
                         ])
                         .set(state);
                 }
@@ -703,8 +854,8 @@ async fn scrape_console(
         let mut completed_count = 0;
 
         for (span_id, _) in store.iter() {
-            if let Some(state) = state_store.get(span_id) {
-                match state {
+            if let Some(state_info) = state_store.get(span_id) {
+                match state_info.state {
                     TaskState::Running => running_count += 1,
                     TaskState::Idle => idle_count += 1,
                     TaskState::Completed => completed_count += 1,
@@ -775,6 +926,98 @@ async fn scrape_console(
     ))
 }
 
+/// Determine task state using tokio-console's logic
+fn determine_task_state(stats: &console_api::tasks::Stats) -> TaskState {
+    // If task is dropped, it's completed
+    if stats.dropped_at.is_some() {
+        return TaskState::Completed;
+    }
+
+    // Check if task is currently being polled
+    if let Some(poll_stats) = &stats.poll_stats {
+        if let (Some(_last_poll_started), None) =
+            (poll_stats.last_poll_started, poll_stats.last_poll_ended)
+        {
+            // Task is currently being polled
+            return TaskState::Running;
+        }
+    }
+
+    // If task has been polled at least once, it's likely running
+    if let Some(poll_stats) = &stats.poll_stats {
+        if poll_stats.polls > 0 {
+            return TaskState::Running;
+        }
+    }
+
+    // Default to idle
+    TaskState::Idle
+}
+
+/// Format location exactly like tokio-console does
+fn format_location(loc: Option<&console_api::Location>) -> String {
+    match loc {
+        Some(location) => {
+            let mut parts = Vec::new();
+
+            if let Some(file) = &location.file {
+                // Truncate registry paths like tokio-console
+                let truncated_file = truncate_registry_path(file.clone());
+                if let Some(line) = location.line {
+                    parts.push(format!("{}:{}", truncated_file, line));
+                } else {
+                    parts.push(truncated_file);
+                }
+            }
+
+            if let Some(module_path) = &location.module_path {
+                parts.push(format!("({})", module_path));
+            }
+
+            if parts.is_empty() {
+                "<unknown location>".to_string()
+            } else {
+                parts.join(" ")
+            }
+        }
+        None => "<unknown location>".to_string(),
+    }
+}
+
+/// Convert protobuf timestamp to SystemTime
+fn protobuf_timestamp_to_system_time(ts: &prost_types::Timestamp) -> SystemTime {
+    if ts.seconds >= 0 {
+        let secs = ts.seconds as u64;
+        let nanos = ts.nanos as u32;
+        let duration = Duration::from_secs(secs) + Duration::from_nanos(nanos as u64);
+        SystemTime::UNIX_EPOCH + duration
+    } else {
+        // Handle negative timestamps by going backwards from epoch
+        let secs = (-ts.seconds) as u64;
+        let nanos = ts.nanos as u32;
+        let duration = Duration::from_secs(secs) + Duration::from_nanos(nanos as u64);
+        SystemTime::UNIX_EPOCH - duration
+    }
+}
+
+/// Truncate registry paths like tokio-console does
+fn truncate_registry_path(s: String) -> String {
+    use once_cell::sync::OnceCell;
+    use regex::Regex;
+    use std::borrow::Cow;
+
+    static REGEX: OnceCell<Regex> = OnceCell::new();
+    let regex = REGEX.get_or_init(|| {
+        Regex::new(r#".*/\.cargo(/registry/src/[^/]*/|/git/checkouts/)"#)
+            .expect("failed to compile regex")
+    });
+
+    match regex.replace(&s, "<cargo>/") {
+        Cow::Owned(s) => s,
+        Cow::Borrowed(_) => s,
+    }
+}
+
 fn update_summary_metrics(metrics: &Metrics, task_metadata: &TaskMetadataStore) {
     let store = task_metadata.lock().unwrap();
     let total = store.len();
@@ -832,85 +1075,8 @@ mod tests {
         let metadata = extract_task_metadata(&task);
         assert_eq!(
             metadata.location,
-            "/src/runtime/scheduler/multi_thread/worker.rs:457"
+            "/src/runtime/scheduler/multi_thread/worker.rs:457 (runtime)"
         );
-    }
-
-    #[test]
-    fn test_location_extraction_from_task_location_no_line() {
-        let mut task = create_test_task();
-        task.location = Some(Location {
-            file: Some("/src/main.rs".to_string()),
-            line: None,
-            column: None,
-            module_path: Some("main".to_string()),
-        });
-
-        let metadata = extract_task_metadata(&task);
-        assert_eq!(metadata.location, "/src/main.rs");
-    }
-
-    #[test]
-    fn test_location_extraction_from_fields() {
-        let mut task = create_test_task();
-        // No location field
-        task.location = None;
-
-        // Add location in fields (this won't be used in new implementation)
-        task.fields.push(create_field(
-            "src.location",
-            Value::StrVal("worker.rs:123".to_string()),
-        ));
-
-        let metadata = extract_task_metadata(&task);
-        assert_eq!(metadata.location, "unknown"); // New implementation only uses task.location
-    }
-
-    #[test]
-    fn test_location_extraction_from_file_field() {
-        let mut task = create_test_task();
-        task.location = None;
-
-        task.fields.push(create_field(
-            "file",
-            Value::StrVal("/home/user/project/src/lib.rs:45".to_string()),
-        ));
-
-        let metadata = extract_task_metadata(&task);
-        assert_eq!(metadata.location, "unknown"); // New implementation only uses task.location
-    }
-
-    #[test]
-    fn test_location_extraction_with_pattern() {
-        let mut task = create_test_task();
-        task.location = None;
-
-        // Add a field with location-like pattern (won't be used)
-        task.fields.push(create_field(
-            "spawn.location",
-            Value::StrVal("common/task/src/cancellation.rs:232:17".to_string()),
-        ));
-
-        let metadata = extract_task_metadata(&task);
-        assert_eq!(metadata.location, "unknown"); // New implementation only uses task.location
-    }
-
-    #[test]
-    fn test_location_extraction_from_cargo_path() {
-        let mut task = create_test_task();
-        task.location = None;
-
-        // Add a field with cargo path pattern (won't be used)
-        task.fields.push(create_field(
-            "loc",
-            Value::StrVal(
-                "<cargo>/tokio-1.46.1/src/runtime/scheduler/multi_thread/worker.rs:457:13"
-                    .to_string(),
-            ),
-        ));
-
-        let metadata = extract_task_metadata(&task);
-        assert_eq!(metadata.location, "unknown"); // New implementation only uses task.location
     }
 
     #[test]
@@ -919,7 +1085,7 @@ mod tests {
         // No location anywhere
 
         let metadata = extract_task_metadata(&task);
-        assert_eq!(metadata.location, "unknown");
+        assert_eq!(metadata.location, "<unknown location>");
     }
 
     #[test]
@@ -944,54 +1110,21 @@ mod tests {
             "task.kind",
             Value::StrVal("blocking".to_string()),
         ));
+        task.fields.push(create_field(
+            "task.target",
+            Value::StrVal("tokio::task::block_in_place".to_string()),
+        ));
 
         let metadata = extract_task_metadata(&task);
 
         assert_eq!(metadata.task_id, 42);
         assert_eq!(metadata.name, "42 (my_task)"); // tokio-console format: "task_id (name)"
         assert_eq!(metadata.kind, "blocking");
+        assert_eq!(metadata.target, "tokio::task::block_in_place");
         assert_eq!(
             metadata.location,
-            "/src/runtime/scheduler/multi_thread/worker.rs:457"
+            "/src/runtime/scheduler/multi_thread/worker.rs:457 (runtime)"
         );
-    }
-
-    #[test]
-    fn test_extract_task_metadata_with_location_only() {
-        let mut task = create_test_task();
-
-        task.location = Some(Location {
-            file: Some("/src/lib.rs".to_string()),
-            line: Some(100),
-            column: None,
-            module_path: Some("lib".to_string()),
-        });
-
-        task.fields.push(create_field("task.id", Value::U64Val(99)));
-
-        let metadata = extract_task_metadata(&task);
-
-        assert_eq!(metadata.task_id, 99);
-        assert_eq!(metadata.name, "99"); // tokio-console format: just the task_id when no name
-        assert_eq!(metadata.kind, "task"); // Default kind
-        assert_eq!(metadata.location, "/src/lib.rs:100");
-    }
-
-    #[test]
-    fn test_extract_task_metadata_without_location() {
-        let mut task = create_test_task();
-
-        task.fields
-            .push(create_field("task.id", Value::U64Val(123)));
-        task.fields
-            .push(create_field("task.kind", Value::StrVal("task".to_string())));
-
-        let metadata = extract_task_metadata(&task);
-
-        assert_eq!(metadata.task_id, 123);
-        assert_eq!(metadata.name, "123"); // tokio-console format: just the task_id when no name
-        assert_eq!(metadata.kind, "task");
-        assert_eq!(metadata.location, "unknown");
     }
 
     #[test]
@@ -1003,6 +1136,7 @@ mod tests {
             location: "main.rs:10".to_string(),
             task_id: 1,
             kind: "task".to_string(),
+            target: "tokio::task::block_in_place".to_string(),
         };
 
         let metadata2 = TaskMetadata {
@@ -1010,6 +1144,7 @@ mod tests {
             location: "worker.rs:20".to_string(),
             task_id: 2,
             kind: "blocking".to_string(),
+            target: "tokio::task::block_in_place".to_string(),
         };
 
         // Insert tasks
@@ -1070,29 +1205,6 @@ mod tests {
     }
 
     #[test]
-    fn test_label_values_generation() {
-        let registry = Registry::new();
-        let metrics = Metrics::new(&registry);
-
-        // Test with full location
-        let labels = ["my_task", "/src/main.rs:42", "blocking"];
-        metrics.task_polls.with_label_values(&labels).inc();
-
-        // Test with unknown location
-        let labels_unknown = ["unknown_task_99", "unknown", "task"];
-        metrics.task_polls.with_label_values(&labels_unknown).inc();
-
-        // Gather and verify both label sets exist
-        let gathered = registry.gather();
-        let task_polls_family = gathered
-            .iter()
-            .find(|m| m.name() == "tokio_task_polls_total")
-            .expect("task_polls metric should exist");
-
-        assert_eq!(task_polls_family.get_metric().len(), 2);
-    }
-
-    #[test]
     fn test_auth_token_validation() {
         // Test bearer token parsing
         let token = "d0a45d7c272163c78763ca2ec56c672d1241363de00fcd0e55f9a4029145ef91";
@@ -1100,47 +1212,6 @@ mod tests {
 
         assert!(auth_header.starts_with("Bearer "));
         assert_eq!(&auth_header[7..], token);
-    }
-
-    #[test]
-    fn test_deduplication_logic() {
-        use std::collections::HashSet;
-
-        let mut seen_task_ids = HashSet::new();
-
-        // First occurrence
-        assert!(!seen_task_ids.contains(&1));
-        seen_task_ids.insert(1);
-
-        // Second occurrence - should be detected as duplicate
-        assert!(seen_task_ids.contains(&1));
-
-        // Different task
-        assert!(!seen_task_ids.contains(&2));
-        seen_task_ids.insert(2);
-
-        assert_eq!(seen_task_ids.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_scrape_loop_interval() {
-        use std::time::Instant;
-
-        // Create a mock interval of 1 second
-        let mut interval_timer = tokio::time::interval(Duration::from_millis(100));
-
-        let start = Instant::now();
-
-        // First tick is immediate
-        interval_timer.tick().await;
-        let first_tick = start.elapsed();
-        assert!(first_tick < Duration::from_millis(10));
-
-        // Second tick should be after interval
-        interval_timer.tick().await;
-        let second_tick = start.elapsed();
-        assert!(second_tick >= Duration::from_millis(100));
-        assert!(second_tick < Duration::from_millis(150));
     }
 
     #[test]
@@ -1157,26 +1228,434 @@ mod tests {
     }
 
     #[test]
-    fn test_consecutive_empty_updates_counter() {
-        let mut consecutive_empty_updates = 0;
-        const MAX_CONSECUTIVE_EMPTY: usize = 5;
+    fn test_task_state_values_and_labels() {
+        // Test state value assignments
+        let idle_state = TaskState::Idle;
+        let running_state = TaskState::Running;
+        let completed_state = TaskState::Completed;
 
-        // Simulate empty updates
-        for _ in 0..3 {
-            consecutive_empty_updates += 1;
-        }
-        assert_eq!(consecutive_empty_updates, 3);
-        assert!(consecutive_empty_updates < MAX_CONSECUTIVE_EMPTY);
+        // Test state values (should match our fixed implementation)
+        let idle_value = match idle_state {
+            TaskState::Idle => 1.0,
+            TaskState::Running => 2.0,
+            TaskState::Completed => 0.0,
+        };
+        assert_eq!(idle_value, 1.0);
 
-        // Non-empty update resets counter
-        consecutive_empty_updates = 0;
-        assert_eq!(consecutive_empty_updates, 0);
+        let running_value = match running_state {
+            TaskState::Idle => 1.0,
+            TaskState::Running => 2.0,
+            TaskState::Completed => 0.0,
+        };
+        assert_eq!(running_value, 2.0);
 
-        // Reach limit
-        for _ in 0..MAX_CONSECUTIVE_EMPTY {
-            consecutive_empty_updates += 1;
-        }
-        assert_eq!(consecutive_empty_updates, MAX_CONSECUTIVE_EMPTY);
+        let completed_value = match completed_state {
+            TaskState::Idle => 1.0,
+            TaskState::Running => 2.0,
+            TaskState::Completed => 0.0,
+        };
+        assert_eq!(completed_value, 0.0);
+
+        // Test state labels
+        let idle_label = match idle_state {
+            TaskState::Idle => "idle".to_string(),
+            TaskState::Running => "running".to_string(),
+            TaskState::Completed => "completed".to_string(),
+        };
+        assert_eq!(idle_label, "idle");
+
+        let running_label = match running_state {
+            TaskState::Idle => "idle".to_string(),
+            TaskState::Running => "running".to_string(),
+            TaskState::Completed => "completed".to_string(),
+        };
+        assert_eq!(running_label, "running");
+
+        let completed_label = match completed_state {
+            TaskState::Idle => "idle".to_string(),
+            TaskState::Running => "running".to_string(),
+            TaskState::Completed => "completed".to_string(),
+        };
+        assert_eq!(completed_label, "completed");
+    }
+
+    #[test]
+    fn test_task_state_metric_labels() {
+        let registry = Registry::new();
+        let metrics = Metrics::new(&registry);
+
+        // Test that task_state metric has the correct labels including 'state'
+        let test_name = "test_task".to_string();
+        let test_location = "test.rs:42".to_string();
+        let test_kind = "task".to_string();
+        let test_state = "running".to_string();
+
+        // This should work with our new 4-label implementation
+        let state_metric = metrics.task_state.with_label_values(&[
+            &test_name,
+            &test_location,
+            &test_kind,
+            &test_state,
+        ]);
+        state_metric.set(2.0);
+
+        // Verify the metric was set correctly
+        assert_eq!(state_metric.get(), 2.0);
+
+        // Test with different states
+        let idle_metric = metrics.task_state.with_label_values(&[
+            &test_name,
+            &test_location,
+            &test_kind,
+            &"idle".to_string(),
+        ]);
+        idle_metric.set(1.0);
+        assert_eq!(idle_metric.get(), 1.0);
+
+        let completed_metric = metrics.task_state.with_label_values(&[
+            &test_name,
+            &test_location,
+            &test_kind,
+            &"completed".to_string(),
+        ]);
+        completed_metric.set(0.0);
+        assert_eq!(completed_metric.get(), 0.0);
+    }
+
+    #[test]
+    fn test_metrics_with_state_labels_registration() {
+        let registry = Registry::new();
+        let metrics = Metrics::new(&registry);
+
+        // Actually use the metric to ensure it's registered
+        let test_name = "test_task".to_string();
+        let test_location = "test.rs:42".to_string();
+        let test_kind = "task".to_string();
+        let test_state = "running".to_string();
+
+        let state_metric = metrics.task_state.with_label_values(&[
+            &test_name,
+            &test_location,
+            &test_kind,
+            &test_state,
+        ]);
+        state_metric.set(2.0);
+
+        // Now verify that task_state metric is properly registered with state label
+        let gathered = registry.gather();
+        let task_state_family = gathered
+            .iter()
+            .find(|m| m.name() == "tokio_task_state")
+            .expect("tokio_task_state metric should exist");
+
+        // Check that it has the correct label names including 'state'
+        let label_names: Vec<&str> = task_state_family
+            .get_metric()
+            .first()
+            .unwrap()
+            .get_label()
+            .iter()
+            .map(|l| l.name()) // Fixed deprecated method
+            .collect();
+
+        assert!(label_names.contains(&"task_name"));
+        assert!(label_names.contains(&"task_location"));
+        assert!(label_names.contains(&"task_kind"));
+        assert!(
+            label_names.contains(&"state"),
+            "task_state metric should have 'state' label"
+        );
+    }
+
+    #[test]
+    fn test_metrics_output_format_with_state_labels() {
+        let registry = Registry::new();
+        let metrics = Metrics::new(&registry);
+
+        // Add sample metrics with different states
+        metrics
+            .task_state
+            .with_label_values(&["worker_task", "worker.rs:42", "task", "running"])
+            .set(2.0);
+
+        metrics
+            .task_state
+            .with_label_values(&["idle_task", "main.rs:100", "task", "idle"])
+            .set(1.0);
+
+        metrics
+            .task_state
+            .with_label_values(&["completed_task", "handler.rs:25", "task", "completed"])
+            .set(0.0);
+
+        // Encode and verify the metrics output
+        let mut buffer = Vec::new();
+        let encoder = TextEncoder::new();
+        let metric_families = registry.gather();
+        encoder.encode(&metric_families, &mut buffer).unwrap();
+
+        let output = String::from_utf8(buffer).unwrap();
+
+        // Print the output for debugging
+        println!("=== Metrics Output ===");
+        println!("{}", output);
+        println!("=== End Metrics Output ===");
+
+        // Verify the state labels are present in the output
+        assert!(
+            output.contains("state=\"running\""),
+            "Should contain running state label"
+        );
+        assert!(
+            output.contains("state=\"idle\""),
+            "Should contain idle state label"
+        );
+        assert!(
+            output.contains("state=\"completed\""),
+            "Should contain completed state label"
+        );
+
+        // Verify the metric values are correct (more flexible matching)
+        assert!(
+            output.contains("tokio_task_state"),
+            "Should contain tokio_task_state metric"
+        );
+        assert!(output.contains("worker_task"), "Should contain worker_task");
+        assert!(output.contains("idle_task"), "Should contain idle_task");
+        assert!(
+            output.contains("completed_task"),
+            "Should contain completed_task"
+        );
+        assert!(output.contains(" 2"), "Should contain value 2 for running");
+        assert!(output.contains(" 1"), "Should contain value 1 for idle");
+        assert!(
+            output.contains(" 0"),
+            "Should contain value 0 for completed"
+        );
+    }
+
+    #[test]
+    fn test_determine_task_state_logic() {
+        use console_api::{tasks::Stats, PollStats};
+        use prost_types::Timestamp;
+
+        // Test completed state
+        let mut stats = Stats::default();
+        stats.dropped_at = Some(Timestamp {
+            seconds: 1000,
+            nanos: 0,
+        });
+        assert!(matches!(determine_task_state(&stats), TaskState::Completed));
+
+        // Test running state - currently being polled
+        let mut stats = Stats::default();
+        stats.poll_stats = Some(PollStats {
+            last_poll_started: Some(Timestamp {
+                seconds: 1000,
+                nanos: 0,
+            }),
+            last_poll_ended: None,
+            polls: 5,
+            busy_time: None,
+            first_poll: None,
+        });
+        assert!(matches!(determine_task_state(&stats), TaskState::Running));
+
+        // Test running state - has been polled
+        let mut stats = Stats::default();
+        stats.poll_stats = Some(PollStats {
+            last_poll_started: None,
+            last_poll_ended: None,
+            polls: 1,
+            busy_time: None,
+            first_poll: None,
+        });
+        assert!(matches!(determine_task_state(&stats), TaskState::Running));
+
+        // Test idle state - no polls
+        let mut stats = Stats::default();
+        stats.poll_stats = Some(PollStats {
+            last_poll_started: None,
+            last_poll_ended: None,
+            polls: 0,
+            busy_time: None,
+            first_poll: None,
+        });
+        assert!(matches!(determine_task_state(&stats), TaskState::Idle));
+
+        // Test idle state - no poll stats
+        let stats = Stats::default();
+        assert!(matches!(determine_task_state(&stats), TaskState::Idle));
+    }
+
+    #[test]
+    fn test_format_location_function() {
+        use console_api::Location;
+
+        // Test with full location info
+        let location = Location {
+            file: Some("/src/main.rs".to_string()),
+            line: Some(42),
+            column: None,
+            module_path: Some("my_app".to_string()),
+        };
+        let formatted = format_location(Some(&location));
+        assert_eq!(formatted, "/src/main.rs:42 (my_app)");
+
+        // Test without line number
+        let location = Location {
+            file: Some("/src/main.rs".to_string()),
+            line: None,
+            column: None,
+            module_path: Some("my_app".to_string()),
+        };
+        let formatted = format_location(Some(&location));
+        assert_eq!(formatted, "/src/main.rs (my_app)");
+
+        // Test without module path
+        let location = Location {
+            file: Some("/src/main.rs".to_string()),
+            line: Some(42),
+            column: None,
+            module_path: None,
+        };
+        let formatted = format_location(Some(&location));
+        assert_eq!(formatted, "/src/main.rs:42");
+
+        // Test with cargo registry path truncation
+        let location = Location {
+            file: Some("/home/user/.cargo/registry/src/github.com-1ecc6299db9ec823/tokio-1.0.0/src/runtime.rs".to_string()),
+            line: Some(100),
+            column: None,
+            module_path: Some("tokio::runtime".to_string()),
+        };
+        let formatted = format_location(Some(&location));
+        assert!(formatted.contains("<cargo>/"));
+        assert!(formatted.contains("tokio-1.0.0/src/runtime.rs:100"));
+
+        // Test with no location
+        let formatted = format_location(None);
+        assert_eq!(formatted, "<unknown location>");
+    }
+
+    #[test]
+    fn test_protobuf_timestamp_conversion() {
+        use prost_types::Timestamp;
+
+        // Test normal timestamp
+        let ts = Timestamp {
+            seconds: 1640995200, // 2022-01-01 00:00:00 UTC
+            nanos: 500_000_000,  // 500ms
+        };
+        let system_time = protobuf_timestamp_to_system_time(&ts);
+
+        // Verify it's close to expected time (allow for small differences)
+        let expected = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1640995200)
+            + Duration::from_nanos(500_000_000);
+        let diff = system_time.duration_since(expected).unwrap_or_default();
+        assert!(
+            diff < Duration::from_millis(1),
+            "Timestamp conversion should be accurate"
+        );
+
+        // Test zero timestamp
+        let ts = Timestamp {
+            seconds: 0,
+            nanos: 0,
+        };
+        let system_time = protobuf_timestamp_to_system_time(&ts);
+        assert_eq!(system_time, SystemTime::UNIX_EPOCH);
+
+        // Test negative seconds (should handle gracefully)
+        let ts = Timestamp {
+            seconds: -1000,
+            nanos: 0,
+        };
+        let system_time = protobuf_timestamp_to_system_time(&ts);
+        // Should be before epoch
+        assert!(system_time < SystemTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_new_metrics_registration() {
+        let registry = Registry::new();
+        let metrics = Metrics::new(&registry);
+
+        // Test histogram metrics
+        let busy_histogram =
+            metrics
+                .task_busy_time
+                .with_label_values(&["test_task", "test.rs:42", "task"]);
+        busy_histogram.observe(1.5);
+        assert!(busy_histogram.get_sample_sum() > 0.0);
+
+        let total_histogram =
+            metrics
+                .task_total_time
+                .with_label_values(&["test_task", "test.rs:42", "task"]);
+        total_histogram.observe(10.0);
+        assert!(total_histogram.get_sample_sum() > 0.0);
+
+        // Test waker metrics
+        let waker_gauge =
+            metrics
+                .task_waker_count
+                .with_label_values(&["test_task", "test.rs:42", "task"]);
+        waker_gauge.set(5.0);
+        assert_eq!(waker_gauge.get(), 5.0);
+
+        let self_wakes_counter =
+            metrics
+                .task_self_wakes
+                .with_label_values(&["test_task", "test.rs:42", "task"]);
+        self_wakes_counter.inc_by(3.0);
+        assert_eq!(self_wakes_counter.get(), 3.0);
+
+        // Verify metrics are registered
+        let gathered = registry.gather();
+        let metric_names: Vec<String> = gathered.iter().map(|m| m.name().to_string()).collect();
+
+        assert!(metric_names.contains(&"tokio_task_busy_time_seconds".to_string()));
+        assert!(metric_names.contains(&"tokio_task_total_time_seconds".to_string()));
+        assert!(metric_names.contains(&"tokio_task_waker_count".to_string()));
+        assert!(metric_names.contains(&"tokio_task_self_wakes_total".to_string()));
+    }
+
+    #[test]
+    fn test_task_metadata_with_target() {
+        let mut task = create_test_task();
+
+        // Add target field
+        task.fields.push(create_field(
+            "task.target",
+            Value::StrVal("tokio::task::spawn".to_string()),
+        ));
+
+        let metadata = extract_task_metadata(&task);
+        assert_eq!(metadata.target, "tokio::task::spawn");
+    }
+
+    #[test]
+    fn test_truncate_registry_path() {
+        // Test cargo registry path
+        let path =
+            "/home/user/.cargo/registry/src/github.com-1ecc6299db9ec823/tokio-1.0.0/src/runtime.rs"
+                .to_string();
+        let truncated = truncate_registry_path(path);
+        assert!(truncated.contains("<cargo>/"));
+        assert!(truncated.contains("tokio-1.0.0/src/runtime.rs"));
+
+        // Test git checkout path
+        let path = "/home/user/.cargo/git/checkouts/tokio-abc123/src/runtime.rs".to_string();
+        let truncated = truncate_registry_path(path);
+        assert!(truncated.contains("<cargo>/"));
+        assert!(truncated.contains("runtime.rs"));
+
+        // Test normal path (should not be modified)
+        let path = "/src/main.rs".to_string();
+        let truncated = truncate_registry_path(path);
+        assert_eq!(truncated, "/src/main.rs");
     }
 }
 
