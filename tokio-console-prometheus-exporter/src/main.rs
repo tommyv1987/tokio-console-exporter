@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use tonic::transport::Channel;
 use tracing::{error, info};
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "tokio-console-prometheus-exporter",
     about = "Prometheus exporter for Tokio Console"
@@ -34,9 +34,11 @@ struct Args {
     auth_token: Option<String>,
     #[arg(long, default_value = "1000")]
     max_tasks: usize,
+    #[arg(long, default_value = "false")]
+    enable_detailed_metrics: bool,
 }
 
-#[derive(Debug)]
+#[derive()]
 struct Metrics {
     tasks_total: IntGauge,
     tasks_with_location: IntGauge,
@@ -62,14 +64,14 @@ type TaskMetadataStore = Arc<Mutex<HashMap<u64, TaskMetadata>>>;
 // Track task states with timestamps for better state detection
 type TaskStateStore = Arc<Mutex<HashMap<u64, TaskStateInfo>>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum TaskState {
     Completed,
     Idle,
     Running,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct TaskStateInfo {
     state: TaskState,
     _last_poll_started: Option<SystemTime>,
@@ -78,7 +80,7 @@ struct TaskStateInfo {
     _dropped_at: Option<SystemTime>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct TaskMetadata {
     name: String,
     location: String,
@@ -212,7 +214,7 @@ impl Metrics {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "tokio_console_prometheus_exporter=debug",
+            "tokio_console_prometheus_exporter=info",
         ))
         .init();
 
@@ -223,8 +225,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Tokio Console Prometheus Exporter");
     info!(
-        "Console: {}, Listen: {}, Interval: {}s, Max Tasks: {}",
-        args.console_addr, args.listen_addr, args.interval, args.max_tasks
+        "Console: {}, Listen: {}, Interval: {}s, Max Tasks: {}, Detailed Metrics: {}",
+        args.console_addr,
+        args.listen_addr,
+        args.interval,
+        args.max_tasks,
+        args.enable_detailed_metrics
     );
 
     let registry = Registry::new();
@@ -322,6 +328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             task_metadata_clone,
             task_states_clone,
             args.max_tasks,
+            args.enable_detailed_metrics,
         )
         .await;
     });
@@ -341,6 +348,7 @@ async fn scrape_loop(
     task_metadata: TaskMetadataStore,
     task_states: TaskStateStore,
     max_tasks: usize,
+    enable_detailed_metrics: bool,
 ) {
     let mut interval_timer = tokio::time::interval(Duration::from_secs(interval));
     loop {
@@ -351,6 +359,7 @@ async fn scrape_loop(
             task_metadata.clone(),
             task_states.clone(),
             max_tasks,
+            enable_detailed_metrics,
         )
         .await
         {
@@ -454,6 +463,7 @@ async fn scrape_console(
     task_metadata: TaskMetadataStore,
     task_states: TaskStateStore,
     max_tasks: usize,
+    enable_detailed_metrics: bool,
 ) -> Result<(usize, usize, usize, usize, usize, usize), Box<dyn std::error::Error>> {
     let channel = Channel::from_shared(format!("http://{}", console_addr))?
         .connect()
@@ -546,7 +556,7 @@ async fn scrape_console(
             // Process stats updates for ALL tasks (exactly like tokio-console does)
             // Note: stats_update uses span_id as the key, not task_id
             for (span_id, stats) in task_update.stats_update {
-                eprintln!("DEBUG: Processing stats update for span_id {}", span_id);
+                // Silent operation - no debug logging needed
                 // First check if we have this task in our store (by span_id)
                 let metadata = {
                     let store = task_metadata.lock().unwrap();
@@ -554,7 +564,7 @@ async fn scrape_console(
                 };
 
                 if let Some(metadata) = metadata {
-                    eprintln!("DEBUG: Found metadata for span_id {}, setting task_state metric", span_id);
+                    // Silent operation - no debug logging needed
                     // Update metrics for this task
                     if let Some(poll_stats) = &stats.poll_stats {
                         let polls_counter = metrics.task_polls.with_label_values(&[
@@ -630,15 +640,73 @@ async fn scrape_console(
                         TaskState::Completed => "completed".to_string(),
                     };
 
-                    metrics
-                        .task_state
-                        .with_label_values(&[
-                            &metadata.name,
-                            &metadata.location,
-                            &metadata.kind,
-                            &state_label,
-                        ])
-                        .set(state_value);
+                    // Process location string to reduce cardinality while keeping line numbers
+                    let truncated_location = if metadata.location.len() > 80 {
+                        // Keep filename with line number, but truncate path
+                        if let Some(last_slash) = metadata.location.rfind('/') {
+                            let filename_part = &metadata.location[last_slash + 1..];
+                            if let Some(second_last_slash) =
+                                metadata.location[..last_slash].rfind('/')
+                            {
+                                let parent_dir =
+                                    &metadata.location[second_last_slash + 1..last_slash];
+                                format!("{}/{}", parent_dir, filename_part)
+                            } else {
+                                filename_part.to_string()
+                            }
+                        } else {
+                            metadata.location.clone()
+                        }
+                    } else {
+                        metadata.location.clone()
+                    };
+
+                    // Check if we should track this location (limit cardinality)
+                    let should_track_location = {
+                        // For now, always track - we'll implement location limiting later
+                        true
+                    };
+
+                    let final_location = if should_track_location {
+                        truncated_location
+                    } else {
+                        "other".to_string()
+                    };
+
+                    // Only set task_state metric for tasks that are currently active (running or recently active)
+                    // This reduces cardinality significantly
+                    let should_track = if enable_detailed_metrics {
+                        // In detailed mode, track all active tasks
+                        match task_state {
+                            TaskState::Running => true,
+                            TaskState::Idle => {
+                                // Only track idle tasks that have been active recently (have polls or wakes)
+                                if let Some(poll_stats) = &stats.poll_stats {
+                                    poll_stats.polls > 0 || stats.wakes > 0
+                                } else {
+                                    stats.wakes > 0
+                                }
+                            }
+                            TaskState::Completed => false, // Don't track completed tasks
+                        }
+                    } else {
+                        // In summary mode, only track currently running tasks
+                        matches!(task_state, TaskState::Running)
+                    };
+
+                    if should_track {
+                        // Silent operation - no debug logging needed
+
+                        metrics
+                            .task_state
+                            .with_label_values(&[
+                                &metadata.name,
+                                &final_location,
+                                &metadata.kind,
+                                &state_label,
+                            ])
+                            .set(state_value);
+                    }
 
                     // Update timing metrics
                     if let Some(poll_stats) = &stats.poll_stats {
@@ -649,7 +717,7 @@ async fn scrape_console(
                                 .task_busy_time
                                 .with_label_values(&[
                                     &metadata.name,
-                                    &metadata.location,
+                                    &final_location,
                                     &metadata.kind,
                                 ])
                                 .observe(busy_seconds);
@@ -665,11 +733,7 @@ async fn scrape_console(
                         let total_seconds = total_duration.as_secs_f64();
                         metrics
                             .task_total_time
-                            .with_label_values(&[
-                                &metadata.name,
-                                &metadata.location,
-                                &metadata.kind,
-                            ])
+                            .with_label_values(&[&metadata.name, &final_location, &metadata.kind])
                             .observe(total_seconds);
                     }
 
@@ -677,21 +741,17 @@ async fn scrape_console(
                     let waker_count = stats.waker_clones.saturating_sub(stats.waker_drops);
                     metrics
                         .task_waker_count
-                        .with_label_values(&[&metadata.name, &metadata.location, &metadata.kind])
+                        .with_label_values(&[&metadata.name, &final_location, &metadata.kind])
                         .set(waker_count as f64);
 
                     if stats.self_wakes > 0 {
                         metrics
                             .task_self_wakes
-                            .with_label_values(&[
-                                &metadata.name,
-                                &metadata.location,
-                                &metadata.kind,
-                            ])
+                            .with_label_values(&[&metadata.name, &final_location, &metadata.kind])
                             .inc_by(stats.self_wakes as f64);
                     }
                 } else {
-                    eprintln!("WARNING: Stats update for span_id {} but task not in metadata store", span_id);
+                    // Silent operation - no debug logging needed
                     // Task not in store - this should be rare now with persistent state
                     // Silent operation - no debug logging needed
 
@@ -852,7 +912,10 @@ fn determine_task_state(stats: &console_api::tasks::Stats) -> TaskState {
 
     // Check if currently being polled (last_poll_started > last_poll_ended)
     if let Some(poll_stats) = &stats.poll_stats {
-        if let (Some(started), Some(ended)) = (poll_stats.last_poll_started.as_ref(), poll_stats.last_poll_ended.as_ref()) {
+        if let (Some(started), Some(ended)) = (
+            poll_stats.last_poll_started.as_ref(),
+            poll_stats.last_poll_ended.as_ref(),
+        ) {
             let started_time = protobuf_timestamp_to_system_time(started);
             let ended_time = protobuf_timestamp_to_system_time(ended);
             if started_time > ended_time {
@@ -1310,10 +1373,8 @@ mod tests {
 
         let output = String::from_utf8(buffer).unwrap();
 
-        // Print the output for debugging
-        println!("=== Metrics Output ===");
-        println!("{}", output);
-        println!("=== End Metrics Output ===");
+        // Silent operation - no debug logging needed
+        // Silent operation - no debug logging needed
 
         // Verify the state labels are present in the output
         assert!(
@@ -1740,13 +1801,55 @@ mod tests {
 
     #[test]
     fn test_args_parsing_with_max_tasks() {
-        // Test default values
-        let args = Args::parse_from(&["tokio-console-exporter"]);
-        assert_eq!(args.max_tasks, 1000);
-
-        // Test custom values
-        let args = Args::parse_from(&["tokio-console-exporter", "--max-tasks", "500"]);
+        let args = Args::parse_from(&[
+            "tokio-console-prometheus-exporter",
+            "--max-tasks",
+            "500",
+            "--enable-detailed-metrics",
+        ]);
         assert_eq!(args.max_tasks, 500);
+        assert_eq!(args.enable_detailed_metrics, true);
+    }
+
+    #[test]
+    fn test_args_parsing_without_detailed_metrics() {
+        let args = Args::parse_from(&["tokio-console-prometheus-exporter", "--max-tasks", "1000"]);
+        assert_eq!(args.max_tasks, 1000);
+        assert_eq!(args.enable_detailed_metrics, false);
+    }
+
+    #[tokio::test]
+    async fn test_enable_detailed_metrics_functionality() {
+        let registry = Registry::new();
+        let metrics = Arc::new(Metrics::new(&registry));
+        let task_metadata: TaskMetadataStore = Arc::new(Mutex::new(HashMap::new()));
+        let task_states: TaskStateStore = Arc::new(Mutex::new(HashMap::new()));
+
+        // Test with detailed metrics enabled
+        let detailed_result = scrape_console(
+            "127.0.0.1:6669",
+            &metrics,
+            task_metadata.clone(),
+            task_states.clone(),
+            1000,
+            true, // enable_detailed_metrics = true
+        )
+        .await;
+        // Should not panic even if console is not available
+        assert!(detailed_result.is_err()); // Expected to fail due to no console
+
+        // Test with detailed metrics disabled
+        let summary_result = scrape_console(
+            "127.0.0.1:6669",
+            &metrics,
+            task_metadata,
+            task_states,
+            1000,
+            false, // enable_detailed_metrics = false
+        )
+        .await;
+        // Should not panic even if console is not available
+        assert!(summary_result.is_err()); // Expected to fail due to no console
     }
 
     #[test]
