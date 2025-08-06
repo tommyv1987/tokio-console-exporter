@@ -1,6 +1,8 @@
 name: Build Linux Binary
 
 on:
+  release:
+    types: [published, created]
   push:
     tags:
       - 'v*'  # Triggers on version tags
@@ -29,6 +31,11 @@ jobs:
         cd tokio-console-prometheus-exporter
         cargo build --release --target x86_64-unknown-linux-gnu
 
+    - name: Debug build output
+      run: |
+        echo "Checking build output..."
+        ls -la tokio-console-prometheus-exporter/target/x86_64-unknown-linux-gnu/release/
+
     - name: Create release directory
       run: |
         mkdir -p release
@@ -50,6 +57,30 @@ jobs:
         name: tokio-console-prometheus-exporter-linux-x86_64
         path: release/tokio-console-prometheus-exporter-linux-x86_64.tar.gz
         retention-days: 30
+
+    - name: Create Release
+      if: github.event_name == 'release'
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.event.release.tag_name }}
+        release_name: ${{ github.event.release.name }}
+        body: ${{ github.event.release.body }}
+        draft: false
+        prerelease: ${{ github.event.release.prerelease }}
+
+    - name: Upload Release Asset
+      if: github.event_name == 'release'
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release/tokio-console-prometheus-exporter-linux-x86_64.tar.gz
+        asset_name: tokio-console-prometheus-exporter-linux-x86_64.tar.gz
+        asset_content_type: application/gzip
 
     - name: Upload to release
       if: startsWith(github.ref, 'refs/tags/')
